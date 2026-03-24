@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+.conda/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# PyInstaller
+*.spec
+
+# Utility scripts with hardcoded local paths
+create_icon.py
+
+# Archive (old versions, test data)
+archive/
+
+# Presentation figures (generated)
+presentation_figures/
+
+# Claude Code
+.claude/

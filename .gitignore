@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Claude Code
+CLAUDE.md
+
+# OS files
+.DS_Store
+Thumbs.db
+nul

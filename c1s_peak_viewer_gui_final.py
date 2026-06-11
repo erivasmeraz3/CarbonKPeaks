@@ -37,6 +37,8 @@ from c1s_fitter_optimized import (load_spectrum, fit_spectrum, calculate_peak_ar
 
 
 class C1sPeakViewerFinal:
+    SETTINGS_PATH = Path.home() / ".carbonkpeaks" / "settings.json"
+
     def __init__(self, root, spectra_dir=None):
         self.root = root
         self.root.title("CarbonKPeaks - C1s XAS Analysis")
@@ -45,14 +47,25 @@ class C1sPeakViewerFinal:
         # Set application icon (try PNG first for better quality, fallback to ICO)
         self._set_app_icon()
 
-        # Data storage
-        self.spectra_dir = Path(spectra_dir) if spectra_dir else Path.home()
+        # Load persisted settings (last directory, etc.) so the app re-opens
+        # to where the user left off. CLI --spectra_dir always wins.
+        self._settings = self._load_settings()
+
+        # Data storage — explicit CLI arg wins; else last-used dir; else home.
+        if spectra_dir:
+            self.spectra_dir = Path(spectra_dir)
+        elif self._settings.get('spectra_dir'):
+            candidate = Path(self._settings['spectra_dir'])
+            self.spectra_dir = candidate if candidate.exists() else Path.home()
+        else:
+            self.spectra_dir = Path.home()
         self.spectra_files = []
         self.current_index = 0
         self.current_result = None
         self.current_energy = None
         self.current_intensity = None
         self._fit_in_progress = False  # Track if a fit is currently running
+        self._refit_pending = False  # Toggle arrived mid-fit; refit when done
 
         # Comparison samples (list of tuples: (name, result, energy, peak_sel))
         self.comparison_samples = []
@@ -95,9 +108,8 @@ class C1sPeakViewerFinal:
         self.peak_display_names = ['Quinone', 'Aromatic', 'Phenolic', 'Aliphatic',
                                    'Carboxyl', 'O-alkyl', 'Carbonate', 'Sigma*']
         self.peak_colors = plt.cm.tab10(np.linspace(0, 1, 8))
-        # Two separate checkboxes: one for fitting, one for quantitation
+        # Single include toggle: controls both fitting and quantification
         self.peak_in_fit = {name: tk.BooleanVar(value=True) for name in self.peak_names}
-        self.peak_in_quant = {name: tk.BooleanVar(value=True) for name in self.peak_names}
         # Peak center parameters (default values and ranges from c1s_fitter_optimized.py)
         self.default_peak_centers = {
             'Quinone': 284.4,
@@ -116,10 +128,13 @@ class C1sPeakViewerFinal:
         # Sigma* has larger range
         self.peak_range_vars['Sigma_star'].set(2.7)  # 291.3 to 294.0
 
-        # FWHM parameters (3 groups)
-        self.fwhm_main_var = tk.DoubleVar(value=1.5)  # Peaks 1-6 (default: 1.5, range: 0.8-2.0)
-        self.fwhm_main_min_var = tk.DoubleVar(value=0.8)
-        self.fwhm_main_max_var = tk.DoubleVar(value=2.0)
+        # FWHM parameters (3 groups).
+        # main_fwhm bounds [0.5, 1.2] cap the peak width below the typical
+        # adjacent-peak spacing (~0.6 eV) so π* peaks (1-6) stay resolvable.
+        # Empirical median across 128 prior fits: 1.0 eV.
+        self.fwhm_main_var = tk.DoubleVar(value=1.0)  # Peaks 1-6 (default: 1.0, range: 0.5-1.2)
+        self.fwhm_main_min_var = tk.DoubleVar(value=0.5)
+        self.fwhm_main_max_var = tk.DoubleVar(value=1.2)
 
         self.fwhm_carb_var = tk.DoubleVar(value=0.8)  # Peak 7 Carbonate (default: 0.8, range: 0.5-1.0)
         self.fwhm_carb_min_var = tk.DoubleVar(value=0.5)
@@ -132,6 +147,13 @@ class C1sPeakViewerFinal:
         # Peak editing mode
         self.custom_peak_centers = tk.BooleanVar(value=False)
 
+        # FWHM mode (the two literature-supported couplings; both keep the
+        # broad sigma* peak at its own width rather than forcing it narrow):
+        #  'per_group' (default, Solomon 3-group, vary within bounds)
+        #  'locked_per_group' (peaks 1-6 = main, 7 = carb, 8 = sigma, ALL vary=False)
+        # To pin any group to an exact width, set its min = max in the FWHM table.
+        self.fwhm_mode = tk.StringVar(value='per_group')
+
         # Auto-reduce threshold (delta-AIC below which a peak is expendable)
         self.auto_reduce_threshold = tk.DoubleVar(value=2.0)
 
@@ -141,11 +163,44 @@ class C1sPeakViewerFinal:
         # Create menu bar (File > Save/Load Fit State, Session)
         self._create_menu_bar()
 
-        # Only auto-load if a directory was specified via command line
+        # Auto-load ONLY when CLI --spectra_dir was explicitly given.
+        # Persisted spectra_dir is used to set the initial-dir of file dialogs
+        # (already wired in __init__), not for automatic loading.
         if spectra_dir is not None:
             self.load_spectra_list()
             if self.spectra_files:
                 self.load_current_spectrum()
+
+    def _load_settings(self):
+        """Read ~/.carbonkpeaks/settings.json. Returns {} if missing/invalid."""
+        try:
+            if self.SETTINGS_PATH.exists():
+                with open(self.SETTINGS_PATH, encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_settings(self):
+        """Persist self._settings to disk. Silent on failure (best-effort)."""
+        try:
+            self.SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.SETTINGS_PATH, 'w', encoding='utf-8') as f:
+                json.dump(self._settings, f, indent=2)
+        except Exception:
+            pass
+
+    def _remember_dir(self, path):
+        """Update + persist the last-used spectra directory."""
+        try:
+            path = Path(path)
+            self.spectra_dir = path if path.is_dir() else path.parent
+            self._settings['spectra_dir'] = str(self.spectra_dir)
+            self._save_settings()
+        except Exception:
+            pass
 
     def _get_file_key(self, index=None):
         """Return a string key for the file at the given index (default: current)."""
@@ -154,35 +209,58 @@ class C1sPeakViewerFinal:
         return str(self.spectra_files[index])
 
     def _save_file_state(self):
-        """Snapshot current F/Q checkbox states and fit result into the cache."""
+        """Snapshot current include states and fit result into the cache."""
         if not self.spectra_files:
             return
         key = self._get_file_key()
+        peaks = {name: self.peak_in_fit[name].get() for name in self.peak_names}
         self.file_state_cache[key] = {
-            'fit_peaks': {name: self.peak_in_fit[name].get() for name in self.peak_names},
-            'quant_peaks': {name: self.peak_in_quant[name].get() for name in self.peak_names},
+            'fit_peaks': peaks,
+            'quant_peaks': peaks,  # backward compat — same as fit_peaks
             'result': self.current_result,
             'energy': self.current_energy,
             'intensity': self.current_intensity,
         }
 
     def _restore_file_state(self):
-        """Restore cached F/Q states and fit result for the current file.
+        """Restore cached include states and fit result for the current file.
 
-        Returns True on cache hit, False on miss.
+        Returns True if a real cached fit can be reused (skip refit).
+        Returns False on cache miss OR when the cached result is a session-loaded
+        snapshot (the caller should then refit so current constraints apply).
+
+        On a "soft" cache hit (stale session result), include states + energy +
+        intensity are still restored so the refit picks up the same F/Q toggles
+        and the same data array without a second disk read.
         """
         if not self.spectra_files:
             return False
         key = self._get_file_key()
         cached = self.file_state_cache.get(key)
         if cached is None:
+            # Hard miss: clear state still holding the previously-viewed
+            # file's data, otherwise load_current_spectrum skips the disk
+            # read and fits this file against the wrong spectrum — and the
+            # stale result must not seed the new file's fit.
+            self.current_energy = None
+            self.current_intensity = None
+            self.current_result = None
+            # Include toggles are per-file state. A file never seen before
+            # starts with the full model, not whatever set the previously
+            # viewed sample happened to use.
+            for name in self.peak_names:
+                self.peak_in_fit[name].set(True)
             return False
         for name in self.peak_names:
             self.peak_in_fit[name].set(cached['fit_peaks'][name])
-            self.peak_in_quant[name].set(cached['quant_peaks'][name])
         self.current_result = cached['result']
         self.current_energy = cached['energy']
         self.current_intensity = cached['intensity']
+        # Treat session-loaded "frozen" results as cache miss so the next
+        # refit applies current constraints (peak separation, FWHM mode, etc).
+        if (self.current_result is None
+                or getattr(self.current_result, '_is_session_loaded', False)):
+            return False
         return True
 
     # ------------------------------------------------------------------
@@ -206,6 +284,9 @@ class C1sPeakViewerFinal:
                               command=self.save_session)
         file_menu.add_command(label="Load Session", accelerator="Ctrl+Shift+L",
                               command=self.load_session)
+        file_menu.add_separator()
+        file_menu.add_command(label="Refit All Samples",
+                              command=self.refit_all_samples)
 
         self.root.bind_all('<Control-s>', lambda e: self.save_fit_state())
         self.root.bind_all('<Control-l>', lambda e: self.load_fit_state())
@@ -230,14 +311,13 @@ class C1sPeakViewerFinal:
             if cached is None:
                 return None
             fit_peaks = cached['fit_peaks']
-            quant_peaks = cached['quant_peaks']
             result = cached['result']
             energy = cached['energy']
         else:
             fit_peaks = {name: self.peak_in_fit[name].get() for name in self.peak_names}
-            quant_peaks = {name: self.peak_in_quant[name].get() for name in self.peak_names}
             result = self.current_result
             energy = self.current_energy
+        quant_peaks = fit_peaks  # unified — include = fit + quant
 
         if result is None:
             return None
@@ -256,7 +336,7 @@ class C1sPeakViewerFinal:
         # Fit statistics
         r_squared = 1 - result.residual.var() / np.var(result.data)
         try:
-            areas = calculate_peak_areas(energy, result)
+            areas = self._peak_areas_cached(energy, result)
         except Exception:
             areas = {name: 0.0 for name in self.peak_names}
         selected_areas = {k: v for k, v in areas.items() if quant_peaks.get(k, False)}
@@ -319,6 +399,12 @@ class C1sPeakViewerFinal:
         # Run a minimal fit to get a valid ModelResult object
         result = self._cached_model.fit(intensity, params, x=energy,
                                         method='leastsq', max_nfev=1)
+        # Mark this result as a session-restored snapshot, not an actual fit.
+        # _restore_file_state will refit on first display so current constraints apply.
+        try:
+            result._is_session_loaded = True
+        except AttributeError:
+            pass
         return result
 
     # ------------------------------------------------------------------
@@ -398,12 +484,10 @@ class C1sPeakViewerFinal:
             messagebox.showwarning("No Data", "Load spectrum data first.")
             return
 
-        # Restore F/Q checkboxes
+        # Restore include checkboxes (use fit_peaks; ignore legacy quant_peaks)
         for name in self.peak_names:
             if name in state.get('fit_peaks', {}):
                 self.peak_in_fit[name].set(state['fit_peaks'][name])
-            if name in state.get('quant_peaks', {}):
-                self.peak_in_quant[name].set(state['quant_peaks'][name])
 
         # Reconstruct result
         param_dict = state.get('parameters', {})
@@ -459,6 +543,7 @@ class C1sPeakViewerFinal:
             'fwhm_sigma': self.fwhm_sigma_var.get(),
             'fwhm_sigma_min': self.fwhm_sigma_min_var.get(),
             'fwhm_sigma_max': self.fwhm_sigma_max_var.get(),
+            'fwhm_mode': self.fwhm_mode.get(),
             'manual_baseline': self.manual_baseline.get(),
             'lock_heights': self.lock_heights.get(),
             'lock_widths': self.lock_widths.get(),
@@ -532,6 +617,16 @@ class C1sPeakViewerFinal:
             self.fwhm_sigma_min_var.set(gc['fwhm_sigma_min'])
         if 'fwhm_sigma_max' in gc:
             self.fwhm_sigma_max_var.set(gc['fwhm_sigma_max'])
+        if 'fwhm_mode' in gc:
+            # Map removed modes from older sessions onto the surviving pair:
+            # the fitted single-width modes -> per_group, the fixed
+            # single-width mode -> locked_per_group (closest behavior).
+            saved_mode = gc['fwhm_mode']
+            saved_mode = {'shared': 'per_group',
+                          'locked': 'locked_per_group',
+                          'locked_single': 'locked_per_group'}.get(saved_mode, saved_mode)
+            if saved_mode in ('per_group', 'locked_per_group'):
+                self.fwhm_mode.set(saved_mode)
         if 'manual_baseline' in gc:
             self.manual_baseline.set(gc['manual_baseline'])
         if 'lock_heights' in gc:
@@ -562,10 +657,14 @@ class C1sPeakViewerFinal:
         self.spectra_files = valid_paths
         self.file_state_cache.clear()
 
-        # Populate sample listbox
+        # Populate sample listboxes (Tab 1 and Tab 2)
         self.sample_listbox.delete(0, tk.END)
+        if hasattr(self, 'available_samples_listbox'):
+            self.available_samples_listbox.delete(0, tk.END)
         for fp in self.spectra_files:
             self.sample_listbox.insert(tk.END, fp.stem)
+            if hasattr(self, 'available_samples_listbox'):
+                self.available_samples_listbox.insert(tk.END, fp.stem)
 
         # Restore per-file states
         per_file = session.get('per_file_states', {})
@@ -580,9 +679,8 @@ class C1sPeakViewerFinal:
             except Exception:
                 continue
 
-            # Restore checkboxes
+            # Restore include state (use fit_peaks; ignore legacy quant_peaks)
             fit_peaks = state.get('fit_peaks', {name: True for name in self.peak_names})
-            quant_peaks = state.get('quant_peaks', {name: True for name in self.peak_names})
 
             # Reconstruct result
             param_dict = state.get('parameters', {})
@@ -595,7 +693,7 @@ class C1sPeakViewerFinal:
 
             self.file_state_cache[file_key] = {
                 'fit_peaks': fit_peaks,
-                'quant_peaks': quant_peaks,
+                'quant_peaks': fit_peaks,  # backward compat
                 'result': result,
                 'energy': energy,
                 'intensity': intensity,
@@ -611,6 +709,97 @@ class C1sPeakViewerFinal:
         messagebox.showinfo("Loaded",
                             f"Session loaded: {len(valid_paths)} spectra, "
                             f"{restored_count} with restored fits.")
+
+    def refit_all_samples(self):
+        """Refit every loaded sample with current constraints.
+
+        Useful after a session load (which restores stored fits as snapshots,
+        not re-optimized fits) or after changing FWHM mode, peak separation,
+        or other constraints. Runs synchronously with a progress window.
+        """
+        if not self.spectra_files:
+            messagebox.showwarning("No Samples", "Load samples first.")
+            return
+
+        n = len(self.spectra_files)
+        if not messagebox.askyesno(
+                "Refit All Samples",
+                f"Refit all {n} loaded samples with current constraints?\n\n"
+                "Existing cached fits will be replaced."):
+            return
+
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("Refitting…")
+        progress_win.geometry("360x100")
+        progress_win.resizable(False, False)
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+        # Closing the window mid-loop would kill the progressbar widgets and
+        # raise TclError on the next update; disable X while work is running.
+        progress_win.protocol("WM_DELETE_WINDOW", lambda: None)
+        progress_win.update_idletasks()
+        px = self.root.winfo_x() + (self.root.winfo_width() - 360) // 2
+        py = self.root.winfo_y() + (self.root.winfo_height() - 100) // 2
+        progress_win.geometry(f"+{px}+{py}")
+
+        progress_label = ttk.Label(progress_win, text=f"0 / {n}", wraplength=320)
+        progress_label.pack(padx=10, pady=(10, 5))
+        progress_var = tk.DoubleVar(value=0)
+        ttk.Progressbar(progress_win, variable=progress_var,
+                        maximum=n, length=320).pack(padx=10, pady=5)
+
+        original_index = self.current_index
+        n_ok, n_err = 0, 0
+        for idx, file_path in enumerate(self.spectra_files):
+            key = str(file_path)
+            try:
+                # Use cached energy/intensity if we already have them so we
+                # don't re-read the same file 16 times.
+                cached = self.file_state_cache.get(key)
+                if cached and cached.get('energy') is not None:
+                    energy = cached['energy']
+                    intensity = cached['intensity']
+                    fit_peaks = cached.get('fit_peaks',
+                        {n: True for n in self.peak_names})
+                else:
+                    energy, intensity = load_spectrum(file_path)
+                    fit_peaks = {nm: self.peak_in_fit[nm].get()
+                                 for nm in self.peak_names}
+
+                self.current_index = idx
+                self.current_energy = energy
+                self.current_intensity = intensity
+                # Apply restored F/Q checkboxes so refit honors them
+                for nm in self.peak_names:
+                    self.peak_in_fit[nm].set(fit_peaks.get(nm, True))
+                # Drop any stale session-loaded result so refit re-seeds cleanly
+                self.current_result = None
+                self.refit_with_enabled_peaks()
+                if self.current_result is None:
+                    # refit_with_enabled_peaks swallows optimizer exceptions;
+                    # surface them here so the sample counts as an error.
+                    raise RuntimeError("fit did not produce a result")
+
+                self.file_state_cache[key] = {
+                    'fit_peaks': fit_peaks,
+                    'quant_peaks': fit_peaks,
+                    'result': self.current_result,
+                    'energy': energy,
+                    'intensity': intensity,
+                }
+                n_ok += 1
+            except Exception as e:
+                n_err += 1
+                print(f"Refit failed for {file_path.name}: {e}")
+            progress_var.set(idx + 1)
+            progress_label.config(text=f"{idx + 1} / {n}: {file_path.stem[:40]}")
+            progress_win.update()
+
+        progress_win.destroy()
+        self.current_index = original_index
+        self.load_current_spectrum()
+        messagebox.showinfo("Refit Complete",
+                            f"Refit {n_ok} samples.\nErrors: {n_err}.")
 
     def on_height1_change(self, *args):
         """Lock step 2 height to step 1 if locked."""
@@ -669,9 +858,13 @@ class C1sPeakViewerFinal:
         main_container = ttk.Frame(parent)
         main_container.pack(fill=tk.BOTH, expand=True)
 
+        # Resizable three-pane layout: drag the dividers to widen the
+        # controls or the sample list (e.g. for long sample names).
+        paned = ttk.PanedWindow(main_container, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
         # Left panel container with scrollbar (wider to show all columns)
-        left_container = ttk.Frame(main_container, width=320)
-        left_container.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
+        left_container = ttk.Frame(paned, width=320)
         left_container.pack_propagate(False)
 
         # Create canvas and scrollbar for left panel
@@ -682,7 +875,11 @@ class C1sPeakViewerFinal:
         left_panel.bind("<Configure>",
             lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all")))
 
-        left_canvas.create_window((0, 0), window=left_panel, anchor="nw", width=300)
+        left_window = left_canvas.create_window((0, 0), window=left_panel, anchor="nw", width=300)
+        # Keep the inner frame as wide as the canvas so widening the pane
+        # actually widens the controls instead of leaving dead space.
+        left_canvas.bind("<Configure>",
+            lambda e: left_canvas.itemconfigure(left_window, width=e.width))
         left_canvas.configure(yscrollcommand=left_scrollbar.set)
 
         # Bind mouse wheel to scroll the left panel only when mouse is over it
@@ -695,13 +892,17 @@ class C1sPeakViewerFinal:
         left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # Middle panel (sample list)
-        middle_panel = ttk.Frame(main_container, width=200)
-        middle_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
+        middle_panel = ttk.Frame(paned, width=200)
         middle_panel.pack_propagate(False)
 
         # Right panel (plots)
-        right_panel = ttk.Frame(main_container)
-        right_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right_panel = ttk.Frame(paned)
+
+        # weight=0 keeps the side panels at their set width when the window
+        # resizes; only the plot area grows. Sashes remain user-draggable.
+        paned.add(left_container, weight=0)
+        paned.add(middle_panel, weight=0)
+        paned.add(right_panel, weight=1)
 
         self.setup_controls(left_panel)
         self.setup_sample_list(middle_panel)
@@ -799,8 +1000,6 @@ class C1sPeakViewerFinal:
         # Actions
         action_frame = ttk.LabelFrame(parent, text="Actions", padding=3)
         action_frame.pack(fill=tk.X)
-        ttk.Button(action_frame, text="Refit",
-                  command=self.refit_spectrum).pack(fill=tk.X, pady=2)
         ttk.Button(action_frame, text="Box Plot Test",
                   command=self.run_box_plot_test).pack(fill=tk.X, pady=2)
         ttk.Button(action_frame, text="Model Selection",
@@ -808,8 +1007,8 @@ class C1sPeakViewerFinal:
         ttk.Button(action_frame, text="Monte Carlo",
                   command=self.run_monte_carlo).pack(fill=tk.X, pady=2)
 
-        # Auto-reduce frame
-        reduce_frame = ttk.LabelFrame(parent, text="Auto-Reduce", padding=3)
+        # Auto-reduce frame (Beta)
+        reduce_frame = ttk.LabelFrame(parent, text="Auto-Reduce  (Beta)", padding=3)
         reduce_frame.pack(fill=tk.X, pady=(5, 0))
 
         threshold_row = ttk.Frame(reduce_frame)
@@ -818,9 +1017,9 @@ class C1sPeakViewerFinal:
         ttk.Spinbox(threshold_row, from_=0, to=10, increment=0.5, width=5,
                     textvariable=self.auto_reduce_threshold).pack(side=tk.LEFT, padx=5)
 
-        ttk.Button(reduce_frame, text="Auto-Reduce",
+        ttk.Button(reduce_frame, text="Auto-Reduce (Beta)",
                   command=self.run_auto_reduce).pack(fill=tk.X, pady=2)
-        ttk.Button(reduce_frame, text="Batch Auto-Reduce",
+        ttk.Button(reduce_frame, text="Batch Auto-Reduce (Beta)",
                   command=self.run_batch_auto_reduce).pack(fill=tk.X, pady=2)
 
         # Export options
@@ -834,6 +1033,8 @@ class C1sPeakViewerFinal:
                   command=self.export_all_data).pack(fill=tk.X, pady=1)
         ttk.Button(export_frame, text="Batch Export All Samples",
                   command=self.batch_export_all).pack(fill=tk.X, pady=1)
+        ttk.Button(export_frame, text="Quick Summary CSV",
+                  command=self.export_quick_summary_csv).pack(fill=tk.X, pady=1)
 
     def setup_peak_parameters(self, parent):
         """Setup peak parameters table with resizable columns using Treeview."""
@@ -846,30 +1047,34 @@ class C1sPeakViewerFinal:
 
         ttk.Label(cb_frame, text="Toggle:", font=('Arial', 8)).pack(side=tk.LEFT)
         self.select_all_fit = tk.BooleanVar(value=True)
-        self.select_all_quant = tk.BooleanVar(value=True)
-        ttk.Checkbutton(cb_frame, text="All Fit", variable=self.select_all_fit,
+        ttk.Checkbutton(cb_frame, text="All", variable=self.select_all_fit,
                        command=self.toggle_all_fit).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(cb_frame, text="All Quant", variable=self.select_all_quant,
-                       command=self.toggle_all_quant).pack(side=tk.LEFT)
 
-        # Create Treeview with columns
-        columns = ('peak', 'center', 'fwhm', 'area')
+        # Create Treeview with columns. Taller rows and a larger font give
+        # the include checkboxes a comfortable click target.
+        style = ttk.Style()
+        style.configure('Peaks.Treeview', rowheight=26, font=('Arial', 10))
+        style.configure('Peaks.Treeview.Heading', font=('Arial', 9, 'bold'))
+        columns = ('peak', 'center', 'fwhm', 'area', 'unc')
         self.peak_tree = ttk.Treeview(frame, columns=columns, show='tree headings',
-                                       height=8, selectmode='none')
+                                       height=8, selectmode='none',
+                                       style='Peaks.Treeview')
 
         # Define column headings and widths (user can resize by dragging)
-        self.peak_tree.heading('#0', text='F/Q', anchor=tk.W)
+        self.peak_tree.heading('#0', text='Include', anchor=tk.W)
         self.peak_tree.heading('peak', text='Peak', anchor=tk.W)
         self.peak_tree.heading('center', text='Center', anchor=tk.CENTER)
         self.peak_tree.heading('fwhm', text='FWHM', anchor=tk.CENTER)
         self.peak_tree.heading('area', text='%Area', anchor=tk.CENTER)
+        self.peak_tree.heading('unc', text='±%', anchor=tk.CENTER)
 
         # Set initial column widths (resizable by user)
-        self.peak_tree.column('#0', width=50, minwidth=40, stretch=False)
+        self.peak_tree.column('#0', width=62, minwidth=50, stretch=False)
         self.peak_tree.column('peak', width=70, minwidth=50)
         self.peak_tree.column('center', width=55, minwidth=40)
         self.peak_tree.column('fwhm', width=50, minwidth=40)
         self.peak_tree.column('area', width=50, minwidth=40)
+        self.peak_tree.column('unc', width=45, minwidth=35)
 
         # Scrollbar
         tree_scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.peak_tree.yview)
@@ -892,44 +1097,28 @@ class C1sPeakViewerFinal:
         self.on_fit_checkbox_changed()
         self.update_peak_tree_display()
 
-    def toggle_all_quant(self):
-        """Toggle all quantification checkboxes."""
-        state = self.select_all_quant.get()
-        for name in self.peak_names:
-            self.peak_in_quant[name].set(state)
-        self.on_quant_checkbox_changed()
-        self.update_peak_tree_display()
-
     def on_peak_tree_click(self, event):
-        """Handle clicks on the peak tree to toggle F/Q checkboxes."""
+        """Handle clicks on the peak tree to toggle include checkboxes."""
         region = self.peak_tree.identify_region(event.x, event.y)
         if region == 'tree':  # Clicked on the tree column (#0)
             item = self.peak_tree.identify_row(event.y)
             if item and item in self.peak_tree_items.values():
-                # Find which peak this is
                 for peak_name, item_id in self.peak_tree_items.items():
                     if item_id == item:
-                        # Determine if click was on F or Q based on x position
-                        col_width = self.peak_tree.column('#0', 'width')
-                        if event.x < col_width / 2:
-                            # Toggle Fit
-                            current = self.peak_in_fit[peak_name].get()
-                            self.peak_in_fit[peak_name].set(not current)
-                            self.on_fit_checkbox_changed()
-                        else:
-                            # Toggle Quant
-                            current = self.peak_in_quant[peak_name].get()
-                            self.peak_in_quant[peak_name].set(not current)
-                            self.on_quant_checkbox_changed()
+                        current = self.peak_in_fit[peak_name].get()
+                        self.peak_in_fit[peak_name].set(not current)
+                        self.on_fit_checkbox_changed()
                         self.update_peak_tree_display()
                         break
 
     def update_peak_tree_display(self):
         """Update the checkbox display in the tree."""
         for peak_name, item_id in self.peak_tree_items.items():
-            fit_char = 'Y' if self.peak_in_fit[peak_name].get() else '-'
-            quant_char = 'Y' if self.peak_in_quant[peak_name].get() else '-'
-            self.peak_tree.item(item_id, text=f"{fit_char} {quant_char}")
+            char = '☑' if self.peak_in_fit[peak_name].get() else '☐'
+            self.peak_tree.item(item_id, text=char)
+        # Keep the "All" box honest: checked only when every peak is included.
+        self.select_all_fit.set(all(self.peak_in_fit[n].get()
+                                    for n in self.peak_names))
 
     def toggle_baseline_visibility(self):
         """Toggle visibility of baseline controls."""
@@ -1043,11 +1232,10 @@ class C1sPeakViewerFinal:
         left_canvas.create_window((0, 0), window=left_scrollable, anchor="nw")
         left_canvas.configure(yscrollcommand=left_scrollbar.set)
 
-        # Enable mouse wheel scrolling on the left panel
+        # Enable mouse wheel scrolling on the left panel (only while pointer is over it)
         def on_left_panel_scroll(event):
             left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-        left_canvas.bind_all("<MouseWheel>", on_left_panel_scroll)
         left_canvas.bind("<Enter>", lambda e: left_canvas.bind_all("<MouseWheel>", on_left_panel_scroll))
         left_canvas.bind("<Leave>", lambda e: left_canvas.unbind_all("<MouseWheel>"))
 
@@ -1100,24 +1288,41 @@ class C1sPeakViewerFinal:
         ttk.Button(btn_frame, text="Clear",
                   command=self.clear_comparison).pack(side=tk.LEFT, padx=2)
 
-        # Plot type selection
-        plot_frame = ttk.LabelFrame(left_scrollable, text="Generate Plots", padding=5)
-        plot_frame.pack(fill=tk.X, pady=(0, 5))
+        # Figure viewer
+        viewer_frame = ttk.LabelFrame(left_scrollable, text="Figure Viewer", padding=5)
+        viewer_frame.pack(fill=tk.X, pady=(0, 5))
 
-        ttk.Button(plot_frame, text="Statistics",
-                  command=self.generate_multi_sample_stats).pack(fill=tk.X, pady=2)
-        ttk.Button(plot_frame, text="Comparison Charts",
-                  command=self.generate_comparison).pack(fill=tk.X, pady=2)
-        ttk.Button(plot_frame, text="Spectral Overlay",
-                  command=self.generate_spectral_overlay).pack(fill=tk.X, pady=2)
+        # Build figure type list
+        self.figure_types = [
+            'Stacked Bar', 'Grouped Bar', 'Mean \u00b1 Std',
+            'Ratio Heatmap', 'Pie Chart', 'Summary Table',
+            'Spectral Overlay',
+        ]
+        # Add trend entries for each functional group (excluding Sigma*)
+        for dname in self.peak_display_names[:-1]:  # skip Sigma*
+            self.figure_types.append(f'Trend: {dname}')
 
-        # Spectral overlay options
-        overlay_frame = ttk.LabelFrame(left_scrollable, text="Overlay Options", padding=5)
-        overlay_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(viewer_frame, text="Figure:").pack(anchor=tk.W)
+        self.figure_type_var = tk.StringVar(value=self.figure_types[0])
+        self.figure_combo = ttk.Combobox(viewer_frame, textvariable=self.figure_type_var,
+                                          values=self.figure_types, state='readonly')
+        self.figure_combo.pack(fill=tk.X, pady=(0, 5))
+        self.figure_combo.bind('<<ComboboxSelected>>', lambda e: self.generate_current_figure())
 
-        # Y-axis offset control (increased range: 0-2.0)
-        ttk.Label(overlay_frame, text="Y-Axis Offset:").pack(anchor=tk.W)
-        offset_container = ttk.Frame(overlay_frame)
+        nav_frame = ttk.Frame(viewer_frame)
+        nav_frame.pack(fill=tk.X)
+        ttk.Button(nav_frame, text='\u25c0 Prev',
+                  command=lambda: self.cycle_figure(-1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav_frame, text='Generate',
+                  command=self.generate_current_figure).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(nav_frame, text='Next \u25b6',
+                  command=lambda: self.cycle_figure(1)).pack(side=tk.LEFT, padx=2)
+
+        # Spectral overlay options (shown/hidden based on figure type)
+        self.overlay_options_frame = ttk.LabelFrame(left_scrollable, text="Overlay Options", padding=5)
+
+        ttk.Label(self.overlay_options_frame, text="Y-Axis Offset:").pack(anchor=tk.W)
+        offset_container = ttk.Frame(self.overlay_options_frame)
         offset_container.pack(fill=tk.X)
         self.y_offset_var = tk.DoubleVar(value=0.5)
         self.offset_scale = ttk.Scale(offset_container, from_=0.0, to=2.0,
@@ -1129,9 +1334,8 @@ class C1sPeakViewerFinal:
         self.y_offset_var.trace('w', lambda *args: self.offset_value_label.config(
             text=f"{self.y_offset_var.get():.2f}"))
 
-        # Show peaks checkbox
         self.show_overlay_peaks = tk.BooleanVar(value=True)
-        ttk.Checkbutton(overlay_frame, text="Show Individual Peaks",
+        ttk.Checkbutton(self.overlay_options_frame, text="Show Individual Peaks",
                        variable=self.show_overlay_peaks).pack(anchor=tk.W)
 
         # Summary statistics display
@@ -1157,19 +1361,36 @@ class C1sPeakViewerFinal:
         self.stat_labels['total'] = ttk.Label(stats_frame, text="0 samples", font=('Arial', 8, 'italic'))
         self.stat_labels['total'].pack(anchor=tk.W, pady=(5, 0))
 
-        # Status label
         self.stats_status_label = self.stat_labels['total']
+
+        # XAS ratio metrics (computed from current % area)
+        ratios_frame = ttk.LabelFrame(left_scrollable, text="Ratios", padding=5)
+        ratios_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ratio_metrics = [
+            ('Aromaticity (Ar/(Ar+Al)):', 'aromaticity_index'),
+            ('Carboxyl/Aromatic:', 'carboxyl_aromatic'),
+            ('Oxygenated-C fraction:', 'oxygenated_fraction'),
+        ]
+        for label, key in ratio_metrics:
+            row_frame = ttk.Frame(ratios_frame)
+            row_frame.pack(fill=tk.X)
+            ttk.Label(row_frame, text=label, font=('Arial', 9)).pack(side=tk.LEFT)
+            self.stat_labels[key] = ttk.Label(row_frame, text="--", font=('Arial', 9, 'bold'))
+            self.stat_labels[key].pack(side=tk.RIGHT)
 
         # Export buttons
         export_frame = ttk.LabelFrame(left_scrollable, text="Export", padding=5)
         export_frame.pack(fill=tk.X)
 
-        ttk.Button(export_frame, text="Export Figure",
+        ttk.Button(export_frame, text="Export Current Figure",
                   command=self.export_analysis_figure).pack(fill=tk.X, pady=2)
         ttk.Button(export_frame, text="Export Data (CSV)",
                   command=self.export_comparison_data).pack(fill=tk.X, pady=2)
-        ttk.Button(export_frame, text="Export Complete Analysis",
-                  command=self.export_complete_analysis).pack(fill=tk.X, pady=2)
+        ttk.Button(export_frame, text="Export Report (PDF)",
+                  command=lambda: self._show_export_dialog('pdf')).pack(fill=tk.X, pady=2)
+        ttk.Button(export_frame, text="Export All Figures",
+                  command=lambda: self._show_export_dialog('all')).pack(fill=tk.X, pady=2)
 
         # Right panel: Zoomable plot area
         right_panel = ttk.Frame(paned)
@@ -1266,14 +1487,483 @@ class C1sPeakViewerFinal:
                                       facecolor='white', edgecolor='none')
             messagebox.showinfo("Success", f"Figure exported to:\n{filepath}")
 
+    # ------------------------------------------------------------------
+    # Figure Viewer — dispatcher, data collection, drawing methods
+    # ------------------------------------------------------------------
+
+    def cycle_figure(self, direction):
+        """Cycle through figure types by +1 or -1."""
+        idx = self.figure_types.index(self.figure_type_var.get())
+        idx = (idx + direction) % len(self.figure_types)
+        self.figure_type_var.set(self.figure_types[idx])
+        self.figure_combo.set(self.figure_types[idx])
+        self.generate_current_figure()
+
+    def _collect_comparison_data(self):
+        """Collect percentages and metadata from comparison_samples.
+
+        Returns:
+            tuple: (sample_names, all_percentages, enabled_peaks,
+                    enabled_display, enabled_colors) or None if no data.
+        """
+        if not self.comparison_samples:
+            return None
+
+        # Union of all per-sample included peaks
+        union_peaks = set()
+        for _name, _result, _energy, peak_sel in self.comparison_samples:
+            for pn in self.peak_names:
+                if peak_sel['fit_peaks'].get(pn, False):
+                    union_peaks.add(pn)
+
+        enabled_peaks = [name for name in self.peak_names if name in union_peaks]
+        enabled_display = [self.peak_display_names[i] for i, name in enumerate(self.peak_names)
+                          if name in union_peaks]
+        enabled_colors = [self.peak_colors[i] for i, name in enumerate(self.peak_names)
+                         if name in union_peaks]
+
+        if not enabled_peaks:
+            return None
+
+        all_percentages = {}
+        for name, result, energy, peak_sel in self.comparison_samples:
+            areas = calculate_peak_areas(energy, result)
+            sample_peaks = [pn for pn in self.peak_names if peak_sel['fit_peaks'].get(pn, False)]
+            enabled_areas = {k: v for k, v in areas.items() if k in sample_peaks}
+            total = sum(enabled_areas.values())
+            if total > 0:
+                pcts = {k: v / total * 100 for k, v in enabled_areas.items()}
+            else:
+                pcts = {}
+            all_percentages[name] = {k: pcts.get(k, 0.0) for k in enabled_peaks}
+
+        sample_names = [name for name, _, _, _ in self.comparison_samples]
+
+        # Update summary labels
+        avg_percentages = {}
+        for peak_name, label_key in [('Aromatic', 'aromaticity'), ('Aliphatic', 'aliphatic'),
+                                      ('Carboxyl', 'carboxyl'), ('O_alkyl', 'oalkyl'),
+                                      ('Carbonate', 'carbonate')]:
+            vals = [all_percentages[s].get(peak_name, 0) for s in sample_names]
+            avg = float(np.mean(vals)) if vals else 0.0
+            avg_percentages[peak_name] = avg
+            self.stat_labels[label_key].config(text=f"{avg:.1f}% (avg)")
+        # Include all peaks (Phenolic / Quinone / etc.) when computing ratios
+        for peak_name in self.peak_names:
+            if peak_name not in avg_percentages:
+                vals = [all_percentages[s].get(peak_name, 0) for s in sample_names]
+                avg_percentages[peak_name] = float(np.mean(vals)) if vals else 0.0
+        self._set_ratio_labels(avg_percentages)
+        self.stat_labels['total'].config(text=f"{len(sample_names)} samples")
+        self.stats_status_label.config(text=f"{len(sample_names)} samples")
+
+        return sample_names, all_percentages, enabled_peaks, enabled_display, enabled_colors
+
+    def generate_current_figure(self):
+        """Dispatch to the appropriate drawing method based on dropdown selection."""
+        fig_type = self.figure_type_var.get()
+
+        # Show/hide overlay options
+        if fig_type == 'Spectral Overlay':
+            self.overlay_options_frame.pack(fill=tk.X, pady=(0, 5))
+        else:
+            self.overlay_options_frame.pack_forget()
+
+        # Spectral overlay has its own data pipeline
+        if fig_type == 'Spectral Overlay':
+            self.generate_spectral_overlay()
+            return
+
+        # All other figures need comparison data
+        data = self._collect_comparison_data()
+        if data is None:
+            self.analysis_fig.clear()
+            ax = self.analysis_fig.add_subplot(111)
+            ax.text(0.5, 0.5, 'Add samples to comparison first\n(Select samples \u2192 Add Selected)',
+                   ha='center', va='center', fontsize=14, color='#666666')
+            ax.axis('off')
+            self.analysis_canvas.draw()
+            return
+
+        sample_names, all_percentages, enabled_peaks, enabled_display, enabled_colors = data
+
+        self.analysis_fig.clear()
+
+        # Publication quality settings
+        plt.rcParams.update({
+            'font.family': 'Arial',
+            'font.size': 11,
+            'axes.linewidth': 1.5,
+            'axes.labelweight': 'bold',
+            'xtick.major.width': 1.5,
+            'ytick.major.width': 1.5,
+        })
+
+        ax = self.analysis_fig.add_subplot(111)
+
+        if fig_type == 'Stacked Bar':
+            self._draw_stacked_bar(ax, sample_names, all_percentages,
+                                    enabled_peaks, enabled_display, enabled_colors)
+        elif fig_type == 'Grouped Bar':
+            self._draw_grouped_bar(ax, sample_names, all_percentages,
+                                    enabled_peaks, enabled_display, enabled_colors)
+        elif fig_type == 'Mean \u00b1 Std':
+            self._draw_mean_std_bar(ax, sample_names, all_percentages,
+                                     enabled_peaks, enabled_display, enabled_colors)
+        elif fig_type == 'Ratio Heatmap':
+            self._draw_ratio_heatmap(ax, sample_names, all_percentages,
+                                      enabled_peaks, enabled_display)
+        elif fig_type == 'Pie Chart':
+            self._draw_pie_chart(ax, sample_names, all_percentages,
+                                  enabled_peaks, enabled_display, enabled_colors)
+        elif fig_type == 'Summary Table':
+            self._draw_summary_table(ax, sample_names, all_percentages,
+                                      enabled_peaks, enabled_display)
+        elif fig_type.startswith('Trend:'):
+            peak_display = fig_type.split('Trend: ')[1]
+            idx = self.peak_display_names.index(peak_display)
+            peak_name = self.peak_names[idx]
+            self._draw_trend(ax, peak_name, peak_display, self.peak_colors[idx],
+                             sample_names, all_percentages)
+
+        self.analysis_fig.tight_layout(pad=2.0)
+        self.analysis_canvas.draw()
+
+    def _apply_pub_style(self, ax):
+        """Apply publication-quality axis styling."""
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+        ax.set_axisbelow(True)
+
+    def _draw_stacked_bar(self, ax, sample_names, all_percentages,
+                           enabled_peaks, enabled_display, enabled_colors):
+        """Stacked bar chart of peak composition per sample."""
+        bottoms = np.zeros(len(sample_names))
+        for pname, disp, color in zip(enabled_peaks, enabled_display, enabled_colors):
+            vals = [all_percentages[s].get(pname, 0) for s in sample_names]
+            ax.bar(range(len(sample_names)), vals, bottom=bottoms,
+                   label=disp, color=color, alpha=0.85, edgecolor='white', linewidth=0.5)
+            bottoms += vals
+
+        ax.set_ylabel('Percentage (%)', fontsize=12, fontweight='bold')
+        ax.set_title('Stacked Peak Distribution', fontsize=14, fontweight='bold')
+        ax.set_xticks(range(len(sample_names)))
+        ax.set_xticklabels(sample_names, rotation=45, ha='right', fontsize=9)
+        ax.legend(fontsize=8, loc='upper right', ncol=3)
+        ax.set_ylim(0, 105)
+        self._apply_pub_style(ax)
+
+    def _draw_grouped_bar(self, ax, sample_names, all_percentages,
+                           enabled_peaks, enabled_display, enabled_colors):
+        """Grouped bar chart comparing samples across peaks."""
+        x = np.arange(len(enabled_peaks))
+        width = 0.8 / max(len(sample_names), 1)
+
+        for i, sname in enumerate(sample_names):
+            vals = [all_percentages[sname].get(pname, 0) for pname in enabled_peaks]
+            offset = (i - len(sample_names) / 2 + 0.5) * width
+            ax.bar(x + offset, vals, width, label=sname, alpha=0.85,
+                   edgecolor='black', linewidth=0.5)
+
+        ax.set_ylabel('Percentage (%)', fontsize=12, fontweight='bold')
+        ax.set_title('Peak Distribution Comparison', fontsize=14, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(enabled_display, rotation=45, ha='right', fontsize=10)
+        ax.legend(fontsize=8, loc='upper right')
+        self._apply_pub_style(ax)
+
+    def _draw_mean_std_bar(self, ax, sample_names, all_percentages,
+                            enabled_peaks, enabled_display, enabled_colors):
+        """Bar chart of mean +/- std across samples."""
+        means, stds = [], []
+        for pname in enabled_peaks:
+            vals = [all_percentages[s].get(pname, 0) for s in sample_names]
+            means.append(np.mean(vals))
+            stds.append(np.std(vals))
+
+        x = np.arange(len(enabled_peaks))
+        bars = ax.bar(x, means, yerr=stds, color=enabled_colors, alpha=0.85,
+                       edgecolor='black', linewidth=1.2, capsize=5,
+                       error_kw={'linewidth': 1.5})
+
+        for bar, m in zip(bars, means):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                    f'{m:.1f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+        ax.set_ylabel('Percentage (%)', fontsize=12, fontweight='bold')
+        ax.set_title(f'Average Peak Distribution (n={len(sample_names)})',
+                     fontsize=14, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(enabled_display, rotation=45, ha='right', fontsize=10, fontweight='bold')
+        self._apply_pub_style(ax)
+
+    def _draw_ratio_heatmap(self, ax, sample_names, all_percentages,
+                             enabled_peaks, enabled_display):
+        """Heatmap of peak ratios relative to first sample."""
+        if len(sample_names) < 2:
+            ax.text(0.5, 0.5, 'Need at least 2 samples for ratio heatmap',
+                   ha='center', va='center', fontsize=14)
+            ax.axis('off')
+            return
+
+        n_peaks = len(enabled_peaks)
+        n_samples = len(sample_names)
+        ratio_matrix = np.zeros((n_peaks, n_samples))
+        ref = sample_names[0]
+
+        for i, pname in enumerate(enabled_peaks):
+            for j, sname in enumerate(sample_names):
+                val = all_percentages[sname].get(pname, 0)
+                ref_val = all_percentages[ref].get(pname, 0)
+                ratio_matrix[i, j] = val / ref_val if ref_val > 0.1 else np.nan
+
+        sns.heatmap(ratio_matrix, annot=True, fmt='.2f', cmap='RdBu_r',
+                   center=1.0, vmin=0, vmax=3,
+                   xticklabels=sample_names, yticklabels=enabled_display,
+                   cbar_kws={'label': 'Ratio'}, ax=ax)
+        ax.set_title(f'Peak Ratio (vs {ref})', fontsize=14, fontweight='bold')
+
+    def _draw_pie_chart(self, ax, sample_names, all_percentages,
+                         enabled_peaks, enabled_display, enabled_colors):
+        """Pie chart — averaged if multiple samples, single if one."""
+        means = []
+        names_nz, colors_nz = [], []
+        for pname, disp, color in zip(enabled_peaks, enabled_display, enabled_colors):
+            vals = [all_percentages[s].get(pname, 0) for s in sample_names]
+            m = np.mean(vals)
+            if m > 0:
+                means.append(m)
+                names_nz.append(disp)
+                colors_nz.append(color)
+
+        if not means:
+            ax.text(0.5, 0.5, 'No peak data', ha='center', va='center', fontsize=14)
+            ax.axis('off')
+            return
+
+        wedges, texts, autotexts = ax.pie(means, labels=names_nz, colors=colors_nz,
+                                           autopct='%1.1f%%', startangle=90,
+                                           textprops={'fontsize': 11})
+        for at in autotexts:
+            at.set_color('white')
+            at.set_fontweight('bold')
+
+        title = sample_names[0] if len(sample_names) == 1 else f'Average (n={len(sample_names)})'
+        ax.set_title(title, fontsize=14, fontweight='bold')
+
+    def _draw_summary_table(self, ax, sample_names, all_percentages,
+                             enabled_peaks, enabled_display):
+        """Summary table of percentages."""
+        ax.axis('off')
+        cell_text = []
+        for pname, dname in zip(enabled_peaks, enabled_display):
+            row = [f"{all_percentages[s].get(pname, 0):.1f}%" for s in sample_names]
+            cell_text.append(row)
+
+        col_labels = [s[:15] + '..' if len(s) > 15 else s for s in sample_names]
+        row_colors = [self.peak_colors[self.peak_names.index(p)] for p in enabled_peaks]
+
+        table = ax.table(cellText=cell_text, rowLabels=enabled_display,
+                         colLabels=col_labels, cellLoc='center', loc='center',
+                         colColours=['lightblue'] * len(sample_names),
+                         rowColours=row_colors)
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1.2, 1.5)
+        ax.set_title('Peak Percentages by Sample', fontsize=14, fontweight='bold')
+
+    def _draw_trend(self, ax, peak_name, peak_display, peak_color,
+                     sample_names, all_percentages):
+        """Trend plot for a single functional group across samples."""
+        vals = np.array([all_percentages[s].get(peak_name, 0) for s in sample_names])
+        x = np.arange(len(sample_names))
+
+        ax.bar(x, vals, color=peak_color, alpha=0.4, edgecolor=peak_color, linewidth=0.5)
+        ax.plot(x, vals, 'o-', color=peak_color, markersize=6, linewidth=1.8,
+                markeredgecolor='white', markeredgewidth=0.8)
+
+        # Mean line
+        mean_val = np.mean(vals)
+        ax.axhline(mean_val, color=peak_color, linestyle='--', linewidth=1.0, alpha=0.6)
+        ax.text(len(sample_names) - 0.3, mean_val, f'  {mean_val:.1f}%',
+                va='center', fontsize=9, color=peak_color, fontweight='bold')
+
+        ax.set_title(f'{peak_display}', fontsize=14, fontweight='bold', color=peak_color)
+        ax.set_ylabel('Peak Area (%)', fontsize=12, fontweight='bold')
+        ax.set_xlabel('Sample', fontsize=12, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(sample_names, rotation=45, ha='right', fontsize=9)
+        ax.set_xlim(-0.6, len(sample_names) - 0.4)
+        ax.set_ylim(0, max(vals.max() * 1.3, 1))
+        self._apply_pub_style(ax)
+
+    # ------------------------------------------------------------------
+    # Export dialog and PDF report
+    # ------------------------------------------------------------------
+
+    def _show_export_dialog(self, mode):
+        """Show a checklist dialog for selecting which figures to export.
+
+        Args:
+            mode: 'pdf' for PDF report, 'all' for individual files + data
+        """
+        if not self.comparison_samples:
+            messagebox.showwarning("Warning", "Add samples to comparison first.")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Export Figures" if mode == 'all' else "Export PDF Report")
+        dialog.geometry("320x500")
+        dialog.resizable(False, True)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Select figures to include:",
+                 font=('Arial', 10, 'bold')).pack(pady=(10, 5), padx=10, anchor=tk.W)
+
+        # Scrollable checkbox list
+        check_frame = ttk.Frame(dialog)
+        check_frame.pack(fill=tk.BOTH, expand=True, padx=10)
+
+        check_vars = {}
+        for ft in self.figure_types:
+            var = tk.BooleanVar(value=True)
+            check_vars[ft] = var
+            ttk.Checkbutton(check_frame, text=ft, variable=var).pack(anchor=tk.W, pady=1)
+
+        # Select/deselect all
+        btn_row = ttk.Frame(dialog)
+        btn_row.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Button(btn_row, text="Select All",
+                  command=lambda: [v.set(True) for v in check_vars.values()]).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="Deselect All",
+                  command=lambda: [v.set(False) for v in check_vars.values()]).pack(side=tk.LEFT, padx=2)
+
+        def do_export():
+            selected = [ft for ft, var in check_vars.items() if var.get()]
+            dialog.destroy()
+            if not selected:
+                return
+            if mode == 'pdf':
+                self._export_pdf_report(selected)
+            else:
+                self._export_all_figures(selected)
+
+        ttk.Button(dialog, text="Export",
+                  command=do_export).pack(pady=10, padx=10, fill=tk.X)
+
+    def _export_pdf_report(self, selected_types):
+        """Export a multi-page PDF report with selected figure types."""
+        from matplotlib.backends.backend_pdf import PdfPages
+        from datetime import datetime
+
+        filepath = filedialog.asksaveasfilename(
+            title="Save PDF Report",
+            defaultextension=".pdf",
+            initialfile=f"CarbonKPeaks_Report_{datetime.now().strftime('%Y%m%d')}.pdf",
+            filetypes=[("PDF files", "*.pdf")]
+        )
+        if not filepath:
+            return
+
+        # Save current figure type to restore later
+        orig_type = self.figure_type_var.get()
+
+        try:
+            with PdfPages(filepath) as pdf:
+                for fig_type in selected_types:
+                    self.figure_type_var.set(fig_type)
+                    self.generate_current_figure()
+                    pdf.savefig(self.analysis_fig, dpi=200, bbox_inches='tight',
+                                facecolor='white')
+
+            # Restore original
+            self.figure_type_var.set(orig_type)
+            self.generate_current_figure()
+            messagebox.showinfo("Success", f"PDF report saved to:\n{filepath}")
+        except Exception as e:
+            self.figure_type_var.set(orig_type)
+            messagebox.showerror("Error", f"Failed to export PDF:\n{e}")
+
+    def _export_all_figures(self, selected_types):
+        """Export individual PNG + PDF files for selected figure types, plus CSV data."""
+        from datetime import datetime
+
+        output_dir = filedialog.askdirectory(title="Select Export Directory")
+        if not output_dir:
+            return
+
+        output_dir = Path(output_dir)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        export_dir = output_dir / f"analysis_export_{timestamp}"
+        export_dir.mkdir(exist_ok=True)
+        plots_dir = export_dir / "figures"
+        plots_dir.mkdir(exist_ok=True)
+
+        orig_type = self.figure_type_var.get()
+
+        try:
+            for fig_type in selected_types:
+                self.figure_type_var.set(fig_type)
+                self.generate_current_figure()
+                safe_name = fig_type.lower().replace(' ', '_').replace('\u00b1', 'pm').replace(':', '_').replace('*', 'star').replace('-', '_')
+                self.analysis_fig.savefig(plots_dir / f"{safe_name}.png", dpi=300, bbox_inches='tight', facecolor='white')
+                self.analysis_fig.savefig(plots_dir / f"{safe_name}.pdf", dpi=300, bbox_inches='tight', facecolor='white')
+
+            # Export CSV data
+            data = self._collect_comparison_data()
+            if data:
+                sample_names, all_percentages, enabled_peaks, enabled_display, _ = data
+                rows = []
+                for sname in sample_names:
+                    row = {'Sample': sname}
+                    for pname, dname in zip(enabled_peaks, enabled_display):
+                        row[dname] = round(all_percentages[sname].get(pname, 0), 2)
+                    rows.append(row)
+                import pandas as pd
+                pd.DataFrame(rows).to_csv(export_dir / "peak_percentages.csv", index=False)
+
+            # Restore
+            self.figure_type_var.set(orig_type)
+            self.generate_current_figure()
+            messagebox.showinfo("Success", f"Exported {len(selected_types)} figures to:\n{export_dir}")
+        except Exception as e:
+            self.figure_type_var.set(orig_type)
+            messagebox.showerror("Error", f"Export failed:\n{e}")
+
     def setup_peak_config_tab(self, parent):
-        """Setup peak centers configuration tab."""
-        main_container = ttk.Frame(parent)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        """Setup peak centers configuration tab (whole tab is scrollable)."""
+        # Outer canvas with vertical scrollbar — wraps the whole tab so the FWHM
+        # mode panel at the bottom is reachable even on shorter windows.
+        outer_canvas = tk.Canvas(parent, highlightthickness=0)
+        outer_scroll = ttk.Scrollbar(parent, orient=tk.VERTICAL,
+                                      command=outer_canvas.yview)
+        outer_canvas.configure(yscrollcommand=outer_scroll.set)
+        outer_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        outer_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        main_container = ttk.Frame(outer_canvas)
+        main_window_id = outer_canvas.create_window((0, 0), window=main_container, anchor="nw")
+        main_container.bind("<Configure>",
+            lambda e: outer_canvas.configure(scrollregion=outer_canvas.bbox("all")))
+        outer_canvas.bind("<Configure>",
+            lambda e: outer_canvas.itemconfig(main_window_id, width=e.width))
+
+        # Mousewheel — only active when pointer is over this tab
+        def _on_wheel(event):
+            outer_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        outer_canvas.bind("<Enter>",
+            lambda e: outer_canvas.bind_all("<MouseWheel>", _on_wheel))
+        outer_canvas.bind("<Leave>",
+            lambda e: outer_canvas.unbind_all("<MouseWheel>"))
+
+        # Top padding (replaces the old main_container pack padding)
+        ttk.Frame(main_container, height=10).pack(fill=tk.X)
 
         # Instructions
         instr_frame = ttk.Frame(main_container)
-        instr_frame.pack(fill=tk.X, pady=(0, 10))
+        instr_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
         ttk.Label(instr_frame, text="Peak Center Configuration",
                  font=('Arial', 12, 'bold')).pack(anchor=tk.W)
@@ -1285,23 +1975,12 @@ class C1sPeakViewerFinal:
         ttk.Checkbutton(instr_frame, text="Use Custom Peak Centers",
                        variable=self.custom_peak_centers).pack(anchor=tk.W, pady=(10, 0))
 
-        # Peak configuration table
+        # Peak configuration table — directly inside the outer-scrolled frame
+        # (no inner scroll; the outer canvas already handles vertical overflow).
         table_frame = ttk.LabelFrame(main_container, text="Peak Centers and Ranges", padding=10)
-        table_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Scrollable frame
-        canvas = tk.Canvas(table_frame)
-        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=canvas.yview)
-        peaks_frame = ttk.Frame(canvas)
-
-        peaks_frame.bind("<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
-        canvas.create_window((0, 0), window=peaks_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        table_frame.pack(fill=tk.X, padx=10)
+        peaks_frame = ttk.Frame(table_frame)
+        peaks_frame.pack(fill=tk.X)
 
         # Header row
         headers = ["Peak", "Default Center (eV)", "Center (eV)", "±Range (eV)", "Min (eV)", "Max (eV)"]
@@ -1354,7 +2033,7 @@ class C1sPeakViewerFinal:
 
         # FWHM configuration section
         fwhm_frame = ttk.LabelFrame(main_container, text="FWHM (Full Width at Half Maximum) Settings", padding=10)
-        fwhm_frame.pack(fill=tk.X, pady=(10, 0))
+        fwhm_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
 
         ttk.Label(fwhm_frame, text="Configure FWHM values and ranges for peak groups",
                  font=('Arial', 9)).pack(anchor=tk.W, pady=(0, 10))
@@ -1371,7 +2050,7 @@ class C1sPeakViewerFinal:
 
         # Main FWHM (peaks 1-6)
         ttk.Label(fwhm_table, text="Main Peaks (1-6)").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-        ttk.Label(fwhm_table, text="1.5").grid(row=1, column=1, padx=5, pady=5)
+        ttk.Label(fwhm_table, text="1.0").grid(row=1, column=1, padx=5, pady=5)
         ttk.Entry(fwhm_table, width=8, textvariable=self.fwhm_main_var).grid(row=1, column=2, padx=5, pady=5)
         ttk.Entry(fwhm_table, width=8, textvariable=self.fwhm_main_min_var).grid(row=1, column=3, padx=5, pady=5)
         ttk.Entry(fwhm_table, width=8, textvariable=self.fwhm_main_max_var).grid(row=1, column=4, padx=5, pady=5)
@@ -1390,9 +2069,29 @@ class C1sPeakViewerFinal:
         ttk.Entry(fwhm_table, width=8, textvariable=self.fwhm_sigma_min_var).grid(row=3, column=3, padx=5, pady=5)
         ttk.Entry(fwhm_table, width=8, textvariable=self.fwhm_sigma_max_var).grid(row=3, column=4, padx=5, pady=5)
 
+        # FWHM mode (per-group / locked per-group)
+        mode_frame = ttk.LabelFrame(fwhm_frame, text="FWHM Coupling Mode",
+                                     padding=8)
+        mode_frame.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Radiobutton(mode_frame,
+            text="Per-group (Solomon — peaks 1-6 share, 7 and 8 vary independently)",
+            variable=self.fwhm_mode, value='per_group').pack(anchor=tk.W, pady=1)
+        ttk.Radiobutton(mode_frame,
+            text="Locked per-group (peaks 1-6 = main, 7 = carb, 8 = sigma — each FIXED at its value above, vary=False)",
+            variable=self.fwhm_mode, value='locked_per_group').pack(anchor=tk.W, pady=1)
+        ttk.Label(mode_frame,
+            text="To pin a group to an exact width, set its Min FWHM = Max FWHM above.",
+            font=('Arial', 8), foreground='#555555').pack(anchor=tk.W, pady=(4, 0))
+
+        # Convenience button: copy the current fit's FWHMs into the group fields.
+        ttk.Button(mode_frame,
+            text="Use current sample's FWHM as session default",
+            command=self.use_current_fwhm_as_session).pack(anchor=tk.W, pady=(6, 0))
+
         # Reset button
         btn_frame = ttk.Frame(main_container)
-        btn_frame.pack(fill=tk.X, pady=(10, 0))
+        btn_frame.pack(fill=tk.X, padx=10, pady=(10, 10))
         ttk.Button(btn_frame, text="Reset to Defaults",
                   command=self.reset_peak_centers).pack(side=tk.LEFT, padx=5)
 
@@ -1407,6 +2106,38 @@ class C1sPeakViewerFinal:
         self.peak_min_labels[peak_name].config(text=f"{center - range_val:.2f}")
         self.peak_max_labels[peak_name].config(text=f"{center + range_val:.2f}")
 
+    def use_current_fwhm_as_session(self):
+        """Copy the current fit's converged FWHMs into the session default fields.
+
+        Sets fwhm_main_var, fwhm_carb_var, fwhm_sigma_var to the values lmfit
+        produced on the currently-displayed fit and switches to
+        'locked_per_group' mode so the next refit honors them across all
+        samples. Does not trigger a refit; use File → Refit All Samples to
+        re-apply across the session.
+        """
+        if self.current_result is None:
+            messagebox.showwarning("No Fit", "Load and fit a sample first.")
+            return
+        try:
+            mfw = float(self.current_result.params['main_fwhm'].value)
+            cfw = float(self.current_result.params['carb_fwhm'].value)
+            sfw = float(self.current_result.params['sigma_fwhm'].value)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read FWHM values:\n{e}")
+            return
+        self.fwhm_main_var.set(round(mfw, 3))
+        self.fwhm_carb_var.set(round(cfw, 3))
+        self.fwhm_sigma_var.set(round(sfw, 3))
+        self.fwhm_mode.set('locked_per_group')
+        messagebox.showinfo(
+            "FWHM Updated",
+            f"Session default FWHMs set from current fit:\n"
+            f"  main = {mfw:.3f} eV\n"
+            f"  carb = {cfw:.3f} eV\n"
+            f"  sigma = {sfw:.3f} eV\n\n"
+            f"Mode switched to 'Locked per-group'.\n"
+            f"Use File → Refit All Samples to apply across the session.")
+
     def reset_peak_centers(self):
         """Reset all peak centers and FWHM to defaults."""
         for name in self.peak_names:
@@ -1417,9 +2148,9 @@ class C1sPeakViewerFinal:
                 self.peak_range_vars[name].set(0.3)
 
         # Reset FWHM values
-        self.fwhm_main_var.set(1.5)
-        self.fwhm_main_min_var.set(0.8)
-        self.fwhm_main_max_var.set(2.0)
+        self.fwhm_main_var.set(1.0)
+        self.fwhm_main_min_var.set(0.5)
+        self.fwhm_main_max_var.set(1.2)
 
         self.fwhm_carb_var.set(0.8)
         self.fwhm_carb_min_var.set(0.5)
@@ -1428,6 +2159,10 @@ class C1sPeakViewerFinal:
         self.fwhm_sigma_var.set(0.6)
         self.fwhm_sigma_min_var.set(0.4)
         self.fwhm_sigma_max_var.set(2.0)
+
+        # Reset FWHM coupling mode too — leaving a locked mode active after a
+        # "reset to defaults" would silently keep widths fixed on the next fit.
+        self.fwhm_mode.set('per_group')
 
         messagebox.showinfo("Success", "Peak centers and FWHM reset to default values")
 
@@ -1452,16 +2187,21 @@ class C1sPeakViewerFinal:
             self.update_plot()
 
     def load_spectra_list(self):
-        """Load list of spectra files."""
+        """Load list of spectra files (.csv, .dat, .txt, .xmu, .xdi, .nor)."""
         if not self.spectra_dir.exists():
             messagebox.showerror("Error", f"Directory not found:\n{self.spectra_dir}")
             return
 
-        self.spectra_files = sorted(list(self.spectra_dir.glob('*.csv')))
+        exts = ('*.csv', '*.dat', '*.txt', '*.xmu', '*.xdi', '*.nor')
+        files = []
+        for ext in exts:
+            files.extend(self.spectra_dir.glob(ext))
+        self.spectra_files = sorted(set(files))
         self.file_state_cache.clear()
 
         if not self.spectra_files:
-            messagebox.showwarning("Warning", f"No CSV files found")
+            messagebox.showwarning("Warning",
+                f"No spectrum files (csv/dat/txt/xmu/xdi/nor) found in:\n{self.spectra_dir}")
             return
 
         self.update_sample_listbox()
@@ -1516,11 +2256,14 @@ class C1sPeakViewerFinal:
             self.plot_multiple_samples(selection)
 
     def add_files(self):
-        """Add individual CSV files to the list."""
+        """Add individual spectrum files to the list."""
         files = filedialog.askopenfilenames(
-            title="Select CSV Files",
+            title="Select Spectrum Files",
             initialdir=self.spectra_dir if hasattr(self, 'spectra_dir') else Path.home(),
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            filetypes=[("Spectrum files", "*.csv *.dat *.txt *.xmu *.xdi *.nor"),
+                       ("CSV files", "*.csv"),
+                       ("DAT files", "*.dat"),
+                       ("All files", "*.*")]
         )
 
         if files:
@@ -1529,6 +2272,9 @@ class C1sPeakViewerFinal:
                 file_path = Path(file_path)
                 if file_path not in self.spectra_files:
                     self.spectra_files.append(file_path)
+
+            # Remember the directory of the first selected file for next launch
+            self._remember_dir(Path(files[0]).parent)
 
             # Sort files by name
             self.spectra_files.sort()
@@ -1567,6 +2313,7 @@ class C1sPeakViewerFinal:
             return
 
         prj_path = Path(prj_path)
+        self._remember_dir(prj_path.parent)
         try:
             spectra = parse_athena_prj(prj_path)
         except Exception as e:
@@ -1662,8 +2409,9 @@ class C1sPeakViewerFinal:
         # Find and remove the file
         for i, file_path in enumerate(self.spectra_files):
             if file_path.stem == selected_name:
+                self.file_state_cache.pop(str(file_path), None)
                 del self.spectra_files[i]
-    
+
                 # Update the listboxes
                 self.update_sample_listbox()
                 if hasattr(self, 'available_samples_listbox'):
@@ -1698,6 +2446,11 @@ class C1sPeakViewerFinal:
             self.current_result = None
             self.current_energy = None
             self.current_intensity = None
+            # Reset include toggles so the next loaded set starts from the
+            # full model instead of inheriting this session's last edits.
+            for name in self.peak_names:
+                self.peak_in_fit[name].set(True)
+            self.update_peak_tree_display()
 
             # Update listboxes
             self.sample_listbox.delete(0, tk.END)
@@ -1815,34 +2568,46 @@ class C1sPeakViewerFinal:
         return self._cached_model.fit(intensity, params, x=energy,
                                       method='leastsq', max_nfev=10000)
 
-    def refit_with_enabled_peaks(self):
+    def refit_with_enabled_peaks(self, fresh_start=False):
         """Refit spectrum with only enabled peaks (disabled peaks have h=0 fixed).
+
+        Args:
+            fresh_start: if True, ignore self.current_result and start from
+                constraint-derived defaults. Used after a peak toggle, where
+                seeding from the prior solution biases the optimizer to the
+                same (often-stuck) local minimum.
 
         Respects custom peak centers, manual baseline, and peak_in_fit settings.
         """
         if self.current_energy is None or self.current_intensity is None:
             return
 
-
-
         energy = self.current_energy
         intensity = self.current_intensity
         est = estimate_baseline_parameters(energy, intensity)
 
-        # Build baseline starting values from current fit result if available
+        # Seed starting values from current fit result if available
+        # (unless fresh_start was requested by the caller).
         baseline_vals = None
-        if not self.manual_baseline.get() and self.current_result is not None:
-            bl = self.current_result.params
-            baseline_vals = {
-                'arc1_center': bl['arc1_center'].value,
-                'arc1_height': bl['arc1_height'].value,
-                'arc1_width': bl['arc1_width'].value,
-                'arc2_center': bl['arc2_center'].value,
-                'arc2_height': bl['arc2_height'].value,
-                'arc2_width': bl['arc2_width'].value,
-            }
+        peak_vals = None
+        if not fresh_start and self.current_result is not None:
+            p = self.current_result.params
+            if not self.manual_baseline.get():
+                baseline_vals = {
+                    'arc1_center': p['arc1_center'].value,
+                    'arc1_height': p['arc1_height'].value,
+                    'arc1_width': p['arc1_width'].value,
+                    'arc2_center': p['arc2_center'].value,
+                    'arc2_height': p['arc2_height'].value,
+                    'arc2_width': p['arc2_width'].value,
+                }
+            peak_vals = {}
+            for i in range(1, 9):
+                peak_vals[f'c{i}'] = p[f'c{i}'].value
+                peak_vals[f'h{i}'] = p[f'h{i}'].value
 
-        params = self._build_fit_params(est, baseline_values=baseline_vals)
+        params = self._build_fit_params(est, baseline_values=baseline_vals,
+                                         peak_values=peak_vals)
 
         # Override baseline params if manual baseline is active
         if self.manual_baseline.get():
@@ -1866,7 +2631,8 @@ class C1sPeakViewerFinal:
         except Exception as e:
             print(f"Refit failed: {e}")
 
-    def _build_fit_params(self, est, peak_set=None, baseline_values=None):
+    def _build_fit_params(self, est, peak_set=None, baseline_values=None,
+                          peak_values=None):
         """Build lmfit Parameters for enabled peaks.
 
         Args:
@@ -1875,6 +2641,8 @@ class C1sPeakViewerFinal:
             baseline_values: optional dict with keys arc1_center, arc1_height,
                 arc1_width, arc2_center, arc2_height, arc2_width to use as
                 starting points (e.g. from a prior fit)
+            peak_values: optional dict with keys c1..c8, h1..h8, main_fwhm,
+                carb_fwhm, sigma_fwhm from a prior fit to seed starting values
 
         Returns:
             lmfit.Parameters object ready for fitting
@@ -1910,6 +2678,12 @@ class C1sPeakViewerFinal:
                   min=0, max=est['data_max'] * 1.5)
 
         # --- Peak parameters (peaks 1-6, shared main_fwhm) ---
+        # Strict bounds: each peak has its own [center-range, center+range].
+        # No separation reparameterization — lmfit/leastsq can't enforce both
+        # individual bounds AND a c_j - c_i ≥ d constraint without expanding
+        # one peak's effective range past its nominal upper bound. Collapse
+        # (c1≈c2 or c4≈c5) is possible when the data prefers it; tighten FWHM
+        # via the FWHM-mode UI to avoid that.
         any_main_enabled = False
         for i, name in enumerate(self.peak_names[:6], 1):
             if self.custom_peak_centers.get():
@@ -1921,21 +2695,29 @@ class C1sPeakViewerFinal:
 
             enabled = (name in peak_set) if peak_set is not None else self.peak_in_fit[name].get()
             if enabled:
-                params.add(f'c{i}', value=center, min=center - range_val, max=center + range_val)
-                params.add(f'h{i}', value=est['data_range'] * 0.3, min=0, max=max_peak_height)
+                c_start = peak_values.get(f'c{i}', center) if peak_values else center
+                h_start = peak_values.get(f'h{i}', est['data_range'] * 0.3) if peak_values else est['data_range'] * 0.3
+                c_start = max(center - range_val, min(center + range_val, c_start))
+                params.add(f'c{i}', value=c_start, min=center - range_val, max=center + range_val)
+                params.add(f'h{i}', value=max(h_start, 0), min=0, max=max_peak_height)
                 any_main_enabled = True
             else:
                 params.add(f'c{i}', value=center, min=center - range_val, max=center + range_val,
                           vary=False)
                 params.add(f'h{i}', value=0, vary=False)
 
-        # Main FWHM — only free if at least one of peaks 1-6 is enabled
-        if self.custom_peak_centers.get():
-            params.add('main_fwhm', value=self.fwhm_main_var.get(),
-                      min=self.fwhm_main_min_var.get(), max=self.fwhm_main_max_var.get(),
-                      vary=any_main_enabled)
+        # Main FWHM — only free if at least one of peaks 1-6 is enabled.
+        # The FWHM table and coupling mode always apply; peak widths and
+        # custom peak centers are independent choices.
+        fwhm_mode = self.fwhm_mode.get()
+        if fwhm_mode == 'locked_per_group':
+            params.add('main_fwhm', value=self.fwhm_main_var.get(), vary=False)
         else:
-            params.add('main_fwhm', value=1.5, min=0.8, max=2.0, vary=any_main_enabled)
+            lo, hi = self.fwhm_main_min_var.get(), self.fwhm_main_max_var.get()
+            start = (peak_values.get('main_fwhm', self.fwhm_main_var.get())
+                     if peak_values else self.fwhm_main_var.get())
+            params.add('main_fwhm', value=min(max(start, lo), hi), min=lo, max=hi,
+                      vary=any_main_enabled)
 
         # --- Carbonate (peak 7) ---
         cname = 'Carbonate'
@@ -1948,17 +2730,22 @@ class C1sPeakViewerFinal:
 
         carb_enabled = (cname in peak_set) if peak_set is not None else self.peak_in_fit[cname].get()
         if carb_enabled:
-            params.add('c7', value=center, min=center - range_val, max=center + range_val)
-            params.add('h7', value=est['data_range'] * 0.2, min=0, max=max_peak_height * 0.8)
-            if self.custom_peak_centers.get():
-                params.add('carb_fwhm', value=self.fwhm_carb_var.get(),
-                          min=self.fwhm_carb_min_var.get(), max=self.fwhm_carb_max_var.get())
+            c7_start = peak_values.get('c7', center) if peak_values else center
+            h7_start = peak_values.get('h7', est['data_range'] * 0.2) if peak_values else est['data_range'] * 0.2
+            c7_start = max(center - range_val, min(center + range_val, c7_start))
+            params.add('c7', value=c7_start, min=center - range_val, max=center + range_val)
+            params.add('h7', value=max(h7_start, 0), min=0, max=max_peak_height * 0.8)
+            if fwhm_mode == 'locked_per_group':
+                params.add('carb_fwhm', value=self.fwhm_carb_var.get(), vary=False)
             else:
-                params.add('carb_fwhm', value=0.8, min=0.5, max=1.0)
+                lo, hi = self.fwhm_carb_min_var.get(), self.fwhm_carb_max_var.get()
+                start = (peak_values.get('carb_fwhm', self.fwhm_carb_var.get())
+                         if peak_values else self.fwhm_carb_var.get())
+                params.add('carb_fwhm', value=min(max(start, lo), hi), min=lo, max=hi)
         else:
             params.add('c7', value=center, vary=False)
             params.add('h7', value=0, vary=False)
-            params.add('carb_fwhm', value=0.8, vary=False)
+            params.add('carb_fwhm', value=self.fwhm_carb_var.get(), vary=False)
 
         # --- Sigma* (peak 8) ---
         sname = 'Sigma_star'
@@ -1971,17 +2758,22 @@ class C1sPeakViewerFinal:
 
         sigma_enabled = (sname in peak_set) if peak_set is not None else self.peak_in_fit[sname].get()
         if sigma_enabled:
-            params.add('c8', value=center, min=center - range_val, max=center + range_val)
-            params.add('h8', value=est['data_range'] * 0.3, min=0, max=max_peak_height)
-            if self.custom_peak_centers.get():
-                params.add('sigma_fwhm', value=self.fwhm_sigma_var.get(),
-                          min=self.fwhm_sigma_min_var.get(), max=self.fwhm_sigma_max_var.get())
+            c8_start = peak_values.get('c8', center) if peak_values else center
+            h8_start = peak_values.get('h8', est['data_range'] * 0.3) if peak_values else est['data_range'] * 0.3
+            c8_start = max(center - range_val, min(center + range_val, c8_start))
+            params.add('c8', value=c8_start, min=center - range_val, max=center + range_val)
+            params.add('h8', value=max(h8_start, 0), min=0, max=max_peak_height)
+            if fwhm_mode == 'locked_per_group':
+                params.add('sigma_fwhm', value=self.fwhm_sigma_var.get(), vary=False)
             else:
-                params.add('sigma_fwhm', value=0.6, min=0.4, max=2.0)
+                lo, hi = self.fwhm_sigma_min_var.get(), self.fwhm_sigma_max_var.get()
+                start = (peak_values.get('sigma_fwhm', self.fwhm_sigma_var.get())
+                         if peak_values else self.fwhm_sigma_var.get())
+                params.add('sigma_fwhm', value=min(max(start, lo), hi), min=lo, max=hi)
         else:
             params.add('c8', value=center, vary=False)
             params.add('h8', value=0, vary=False)
-            params.add('sigma_fwhm', value=0.6, vary=False)
+            params.add('sigma_fwhm', value=self.fwhm_sigma_var.get(), vary=False)
 
         return params
 
@@ -2009,16 +2801,17 @@ class C1sPeakViewerFinal:
         # Step 1: fit the full model first to establish good baseline values
         full_params = self._build_fit_params(est, peak_set=peak_set)
         baseline_vals = None
+        full_fit_result = None
         try:
-            full_result = model.fit(intensity, full_params, x=energy,
-                                    method='leastsq', max_nfev=10000)
+            full_fit_result = model.fit(intensity, full_params, x=energy,
+                                        method='leastsq', max_nfev=10000)
             baseline_vals = {
-                'arc1_center': full_result.params['arc1_center'].value,
-                'arc1_height': full_result.params['arc1_height'].value,
-                'arc1_width': full_result.params['arc1_width'].value,
-                'arc2_center': full_result.params['arc2_center'].value,
-                'arc2_height': full_result.params['arc2_height'].value,
-                'arc2_width': full_result.params['arc2_width'].value,
+                'arc1_center': full_fit_result.params['arc1_center'].value,
+                'arc1_height': full_fit_result.params['arc1_height'].value,
+                'arc1_width': full_fit_result.params['arc1_width'].value,
+                'arc2_center': full_fit_result.params['arc2_center'].value,
+                'arc2_height': full_fit_result.params['arc2_height'].value,
+                'arc2_width': full_fit_result.params['arc2_width'].value,
             }
         except Exception:
             pass
@@ -2030,31 +2823,48 @@ class C1sPeakViewerFinal:
             display = self.peak_display_names[idx]
             configs.append((f"Without {display}", peak_set - {name}))
 
+        ss_tot = np.sum((intensity - np.mean(intensity))**2)
+
+        def _stats_from_result(result_obj, params_obj):
+            n_free = sum(1 for p in params_obj.values()
+                         if p.vary and p.expr is None)
+            residuals = result_obj.residual
+            r_squared = 1 - np.sum(residuals**2) / ss_tot
+            return {
+                'n_free': n_free,
+                'aic': result_obj.aic,
+                'bic': result_obj.bic,
+                'r_squared': r_squared,
+                'abbe': self._abbe_criterion(residuals),
+                'resid_std': float(np.std(residuals)),
+            }
+
         results = []
         for cfg_idx, (label, test_set) in enumerate(configs):
+            # Reuse the full-model fit from Step 1 for the "Full model" config
+            # to avoid an identical second fit.
+            if cfg_idx == 0 and full_fit_result is not None:
+                stats = _stats_from_result(full_fit_result, full_params)
+                results.append({
+                    'label': label, 'peaks': test_set.copy(),
+                    'n_peaks': len(test_set), **stats,
+                })
+                if progress_cb:
+                    progress_cb(cfg_idx + 1, len(configs))
+                continue
+
             params = self._build_fit_params(est, peak_set=test_set,
                                             baseline_values=baseline_vals)
-
-            # Count free parameters
             n_free = sum(1 for p in params.values()
-                        if p.vary and p.expr is None)
+                         if p.vary and p.expr is None)
 
             try:
                 result = model.fit(intensity, params, x=energy,
                                    method='leastsq', max_nfev=10000)
-                residuals = result.residual
-                ss_res = np.sum(residuals**2)
-                ss_tot = np.sum((intensity - np.mean(intensity))**2)
-                r_squared = 1 - ss_res / ss_tot
-                resid_std = np.std(residuals)
-                aic, bic = self._compute_aic_bic(residuals, n_free)
-                abbe = self._abbe_criterion(residuals)
-
+                stats = _stats_from_result(result, params)
                 results.append({
                     'label': label, 'peaks': test_set.copy(),
-                    'n_peaks': len(test_set), 'n_free': n_free,
-                    'aic': aic, 'bic': bic, 'r_squared': r_squared,
-                    'abbe': abbe, 'resid_std': resid_std,
+                    'n_peaks': len(test_set), **stats,
                 })
             except Exception:
                 results.append({
@@ -2933,6 +3743,9 @@ class C1sPeakViewerFinal:
         progress_win.resizable(False, False)
         progress_win.transient(self.root)
         progress_win.grab_set()
+        # Closing the window mid-loop would kill the progressbar widgets and
+        # raise TclError on the next update; disable X while work is running.
+        progress_win.protocol("WM_DELETE_WINDOW", lambda: None)
 
         progress_win.update_idletasks()
         px = self.root.winfo_x() + (self.root.winfo_width() - 320) // 2
@@ -3109,6 +3922,9 @@ class C1sPeakViewerFinal:
         progress_win.resizable(False, False)
         progress_win.transient(self.root)
         progress_win.grab_set()
+        # Closing the window mid-loop would kill the progressbar widgets and
+        # raise TclError on the next update; disable X while work is running.
+        progress_win.protocol("WM_DELETE_WINDOW", lambda: None)
 
         progress_win.update_idletasks()
         px = self.root.winfo_x() + (self.root.winfo_width() - 320) // 2
@@ -3313,6 +4129,13 @@ class C1sPeakViewerFinal:
         noise_level = np.std(self.current_result.residual)
         best_fit_curve = self.current_result.best_fit.copy()
 
+        # Snapshot inputs so the worker stays consistent if the user switches sample
+        energy_snapshot = self.current_energy.copy()
+        intensity_snapshot = self.current_intensity.copy()
+        param_snapshot = {k: p.value for k, p in self.current_result.params.items()}
+        sample_name_snapshot = (self.spectra_files[self.current_index].stem
+                                if self.spectra_files else "Unknown")
+
         # Create progress window
         progress_win = tk.Toplevel(self.root)
         progress_win.title("Monte Carlo Analysis")
@@ -3320,6 +4143,9 @@ class C1sPeakViewerFinal:
         progress_win.resizable(False, False)
         progress_win.transient(self.root)
         progress_win.grab_set()
+        # Closing the window mid-loop would kill the progressbar widgets and
+        # raise TclError on the next update; disable X while work is running.
+        progress_win.protocol("WM_DELETE_WINDOW", lambda: None)
 
         progress_win.update_idletasks()
         px = self.root.winfo_x() + (self.root.winfo_width() - 320) // 2
@@ -3344,21 +4170,16 @@ class C1sPeakViewerFinal:
 
         def do_fits():
 
-            energy = self.current_energy
-            est = estimate_baseline_parameters(energy, self.current_intensity)
+            energy = energy_snapshot
+            est = estimate_baseline_parameters(energy, intensity_snapshot)
             rng = np.random.default_rng()
             model = self._cached_model
 
             # Extract baseline values once (outside loop)
-            bl = self.current_result.params
-            bl_vals = {
-                'arc1_center': bl['arc1_center'].value,
-                'arc1_height': bl['arc1_height'].value,
-                'arc1_width': bl['arc1_width'].value,
-                'arc2_center': bl['arc2_center'].value,
-                'arc2_height': bl['arc2_height'].value,
-                'arc2_width': bl['arc2_width'].value,
-            }
+            bl_vals = {k: param_snapshot[k] for k in (
+                'arc1_center', 'arc1_height', 'arc1_width',
+                'arc2_center', 'arc2_height', 'arc2_width',
+            )}
 
             peak_names_set = {name for _, name in enabled_peaks}
 
@@ -3371,11 +4192,10 @@ class C1sPeakViewerFinal:
                 params = self._build_fit_params(est, baseline_values=bl_vals,
                                                 peak_set=peak_names_set)
 
-                # Seed peak heights from current fit so we purely test
+                # Seed peak heights from snapshot so we purely test
                 # noise sensitivity, not starting-condition effects
-                cur = self.current_result.params
                 for pi, pname in enabled_peaks:
-                    params[f'h{pi}'].set(value=cur[f'h{pi}'].value)
+                    params[f'h{pi}'].set(value=param_snapshot[f'h{pi}'])
 
                 try:
                     result = model.fit(synthetic, params, x=energy,
@@ -3423,14 +4243,17 @@ class C1sPeakViewerFinal:
             self._show_monte_carlo_results(enabled_peaks, all_areas, all_r_squared,
                                            noise_level, all_synthetic,
                                            all_fit_curves, best_fit_curve,
-                                           all_peak_curves)
+                                           all_peak_curves,
+                                           energy=energy_snapshot,
+                                           sample_name=sample_name_snapshot)
 
         thread = threading.Thread(target=do_fits, daemon=True)
         thread.start()
 
     def _show_monte_carlo_results(self, enabled_peaks, all_areas, all_r_squared,
                                   noise_level, all_synthetic, all_fit_curves,
-                                  best_fit_curve, all_peak_curves):
+                                  best_fit_curve, all_peak_curves,
+                                  energy=None, sample_name=None):
         """Display Monte Carlo analysis results: fit overlay and box plots."""
         from matplotlib.patches import Patch
 
@@ -3458,9 +4281,11 @@ class C1sPeakViewerFinal:
             cvs.append(cv)
             stds.append(np.std(vals))
 
-        sample_name = (self.spectra_files[self.current_index].stem
-                       if self.spectra_files else "Unknown")
-        energy = self.current_energy
+        if sample_name is None:
+            sample_name = (self.spectra_files[self.current_index].stem
+                           if self.spectra_files else "Unknown")
+        if energy is None:
+            energy = self.current_energy
 
         # Build peak color map: peak_name -> matplotlib color
         peak_color_map = {}
@@ -3691,15 +4516,20 @@ class C1sPeakViewerFinal:
 
         try:
             if self._restore_file_state():
-                # Cache hit — skip loading/fitting
+                # Cache hit with a real fit — skip loading/fitting
                 pass
             else:
-                # Cache miss — load data, fit, then cache
-                self.current_energy, self.current_intensity = load_spectrum(file_path)
+                # Cache miss (or stale session result). _restore_file_state
+                # already populated current_energy/current_intensity if there
+                # was a soft hit; only read from disk if it didn't.
+                if self.current_energy is None or self.current_intensity is None:
+                    self.current_energy, self.current_intensity = load_spectrum(file_path)
 
-                # Check for a saved fit-state sidecar file
+                # Check for a saved fit-state sidecar file (skip for session reloads,
+                # which already carry their own restored parameters).
+                soft_hit = file_path is not None and str(file_path) in self.file_state_cache
                 sidecar = file_path.parent / f"{file_path.stem}_fit.json"
-                if sidecar.exists():
+                if sidecar.exists() and not soft_hit:
                     load_it = messagebox.askyesno(
                         "Saved Fit Found",
                         f"A saved fit state was found:\n{sidecar.name}\n\n"
@@ -3707,9 +4537,20 @@ class C1sPeakViewerFinal:
                     if load_it:
                         self._apply_fit_state(str(sidecar))
                         return
+                # Drop any stale session-loaded result so refit_with_enabled_peaks
+                # starts from constraint defaults rather than the saved (possibly
+                # local-minimum) parameters. Without this, the optimizer is seeded
+                # at the bad point and converges right back to it — the user had to
+                # toggle a peak to perturb out of it.
+                if (self.current_result is not None
+                        and getattr(self.current_result, '_is_session_loaded', False)):
+                    self.current_result = None
                 # Fit using refit_with_enabled_peaks which respects peak_in_fit,
-                # custom centers, and manual baseline settings
-                self.refit_with_enabled_peaks()
+                # custom centers, and manual baseline settings. Always a fresh
+                # start: any result in memory belongs to a different sample or
+                # a stale snapshot, and warm-starting from it drags the
+                # optimizer into that sample's local minimum.
+                self.refit_with_enabled_peaks(fresh_start=True)
                 self._save_file_state()
 
             self.update_peak_tree_display()
@@ -3759,22 +4600,59 @@ class C1sPeakViewerFinal:
                                         result.params['arc2_height'].value,
                                         result.params['arc2_width'].value)
 
+        # Use a finer grid for smooth Gaussian + baseline rendering. Source
+        # data often has only ~5 pts/eV which renders peaks as visible straight
+        # segments. We keep the original energy array for the residuals and
+        # data markers.
+        fine_energy = np.linspace(energy.min(), energy.max(), 600)
+        if self.manual_baseline.get():
+            fine_baseline = double_arctangent(fine_energy,
+                self.baseline_params['arc1_center'].get(),
+                self.baseline_params['arc1_height'].get(),
+                self.baseline_params['arc1_width'].get(),
+                self.baseline_params['arc2_center'].get(),
+                self.baseline_params['arc2_height'].get(),
+                self.baseline_params['arc2_width'].get())
+        else:
+            fine_baseline = double_arctangent(fine_energy,
+                result.params['arc1_center'].value,
+                result.params['arc1_height'].value,
+                result.params['arc1_width'].value,
+                result.params['arc2_center'].value,
+                result.params['arc2_height'].value,
+                result.params['arc2_width'].value)
+
+        # Build fine-grid total fit by evaluating the model at fine_energy
+        fine_total = fine_baseline.copy()
+        for i in range(1, 9):
+            if not self.peak_in_fit[self.peak_names[i - 1]].get():
+                continue
+            c = result.params[f'c{i}'].value
+            h = result.params[f'h{i}'].value
+            if i <= 6:
+                fw = result.params['main_fwhm'].value
+            elif i == 7:
+                fw = result.params['carb_fwhm'].value
+            else:
+                fw = result.params['sigma_fwhm'].value
+            fine_total = fine_total + gaussian(fine_energy, c, h, fw)
+
         # Determine what to plot
         if self.show_baseline.get():
             # Show everything with baseline
             self.ax1.plot(energy, intensity, 'ko', markersize=3, alpha=0.6, label='Data')
-            self.ax1.plot(energy, result.best_fit, 'r-', linewidth=2, label='Total Fit')
-            self.ax1.plot(energy, baseline, 'k--', linewidth=1.5, alpha=0.5, label='Baseline')
-            y_offset = baseline
+            self.ax1.plot(fine_energy, fine_total, 'r-', linewidth=2, label='Total Fit')
+            self.ax1.plot(fine_energy, fine_baseline, 'k--', linewidth=1.5, alpha=0.5, label='Baseline')
+            fine_y_offset = fine_baseline
             ylabel = 'Normalized Absorption'
         else:
             # Show baseline-subtracted but keep fit
             self.ax1.plot(energy, intensity - baseline, 'ko', markersize=3, alpha=0.6, label='Data - Baseline')
-            self.ax1.plot(energy, result.best_fit - baseline, 'r-', linewidth=2, label='Fit - Baseline')
-            y_offset = np.zeros_like(baseline)
+            self.ax1.plot(fine_energy, fine_total - fine_baseline, 'r-', linewidth=2, label='Fit - Baseline')
+            fine_y_offset = np.zeros_like(fine_baseline)
             ylabel = 'Baseline-Subtracted Absorption'
 
-        # Plot peaks
+        # Plot individual peaks on the fine grid
         if self.show_peaks.get():
             for i, (name, display_name, color) in enumerate(zip(self.peak_names, self.peak_display_names, self.peak_colors), 1):
                 if not self.peak_in_fit[name].get():
@@ -3790,15 +4668,15 @@ class C1sPeakViewerFinal:
                 else:
                     fwhm = result.params['sigma_fwhm'].value
 
-                peak = gaussian(energy, center, height, fwhm)
-                self.ax1.plot(energy, peak + y_offset, '--', color=color,
+                peak_fine = gaussian(fine_energy, center, height, fwhm)
+                self.ax1.plot(fine_energy, peak_fine + fine_y_offset, '--', color=color,
                              linewidth=1.5, alpha=0.7, label=display_name)
 
         self.ax1.set_xlabel('Energy (eV)', fontsize=11)
         self.ax1.set_ylabel(ylabel, fontsize=11)
 
         title = f'C1s XAS: {self.spectra_files[self.current_index].stem}'
-        if validate_baseline and not self.manual_baseline.get():
+        if not self.manual_baseline.get():
             is_valid, _ = validate_baseline(energy, result, intensity)
             title += " [OK]" if is_valid else " [!]"
 
@@ -3821,6 +4699,74 @@ class C1sPeakViewerFinal:
         self.canvas.draw()
 
     @staticmethod
+    def _compute_xas_ratios(percentages):
+        """Compute common C 1s XAS diagnostic ratios from a peak-percentage dict.
+
+        Returns a dict with:
+          aromaticity_index: Aromatic / (Aromatic + Aliphatic)
+          carboxyl_aromatic: Carboxyl / Aromatic
+          oxygenated_fraction: (Phenolic + Carboxyl + O_alkyl + Carbonate) / sum(all)
+        Missing peaks default to 0; ratios with zero denominator return None.
+        """
+        ar = percentages.get('Aromatic', 0.0)
+        al = percentages.get('Aliphatic', 0.0)
+        cx = percentages.get('Carboxyl', 0.0)
+        ph = percentages.get('Phenolic', 0.0)
+        oa = percentages.get('O_alkyl', 0.0)
+        cb = percentages.get('Carbonate', 0.0)
+
+        out = {}
+        out['aromaticity_index'] = (ar / (ar + al)) if (ar + al) > 0 else None
+        out['carboxyl_aromatic'] = (cx / ar) if ar > 0 else None
+        total = sum(percentages.values())
+        out['oxygenated_fraction'] = ((ph + cx + oa + cb) / total) if total > 0 else None
+        return out
+
+    def _set_ratio_labels(self, percentages):
+        """Update the Ratios labels for the given percentage dict."""
+        ratios = self._compute_xas_ratios(percentages)
+        fmts = {
+            'aromaticity_index': lambda v: f"{v:.3f}",
+            'carboxyl_aromatic': lambda v: f"{v:.2f}",
+            'oxygenated_fraction': lambda v: f"{v * 100:.1f}%",
+        }
+        for key, fmt in fmts.items():
+            v = ratios.get(key)
+            self.stat_labels[key].config(text=fmt(v) if v is not None else "—")
+
+    @staticmethod
+    def _relative_area_unc(height, fwhm, h_stderr, fwhm_stderr):
+        """Propagate lmfit height + FWHM stderr to a relative area uncertainty.
+
+        Area = h * fwhm * K, so (sigma_area/area)^2 ~= (sigma_h/h)^2 + (sigma_fwhm/fwhm)^2
+        assuming the two are independent. Returns the relative uncertainty as a
+        fraction (0.08 = 8%), or None if either input is missing/non-finite.
+        """
+        if height is None or fwhm is None or height <= 0 or fwhm <= 0:
+            return None
+        rel_h = (h_stderr / height) if (h_stderr is not None and np.isfinite(h_stderr)) else 0.0
+        rel_f = (fwhm_stderr / fwhm) if (fwhm_stderr is not None and np.isfinite(fwhm_stderr)) else 0.0
+        if rel_h == 0.0 and rel_f == 0.0:
+            return None
+        return float(np.sqrt(rel_h ** 2 + rel_f ** 2))
+
+    def _peak_areas_cached(self, energy, result):
+        """Memoized calculate_peak_areas — area dict is stashed on the result
+        object so repeat consumers (peak table + statistics + serializer) on
+        the same fit don't recompute."""
+        if result is None:
+            return {}
+        cached = getattr(result, '_carbonk_areas', None)
+        if cached is not None:
+            return cached
+        areas = calculate_peak_areas(energy, result)
+        try:
+            result._carbonk_areas = areas
+        except AttributeError:
+            pass
+        return areas
+
+    @staticmethod
     def _abbe_criterion(residuals):
         """Compute the Abbe criterion for residual autocorrelation.
 
@@ -3836,15 +4782,6 @@ class C1sPeakViewerFinal:
             return 1.0
         return (ss_diff / (2 * (n - 1))) / (ss_total / (n - 1))
 
-    @staticmethod
-    def _compute_aic_bic(residuals, n_free):
-        """Compute RSS-based AIC and BIC (consistent with model selection)."""
-        n = len(residuals)
-        ss_res = np.sum(residuals ** 2)
-        aic = n * np.log(ss_res / n) + 2 * n_free
-        bic = n * np.log(ss_res / n) + n_free * np.log(n)
-        return aic, bic
-
     def update_statistics(self):
         """Update fit statistics."""
         if self.current_result is None:
@@ -3854,9 +4791,7 @@ class C1sPeakViewerFinal:
         r_squared = 1 - result.residual.var() / np.var(result.data)
         resid_std = np.std(result.residual)
         abbe = self._abbe_criterion(result.residual)
-        n_free = sum(1 for p in result.params.values()
-                     if p.vary and p.expr is None)
-        aic, bic = self._compute_aic_bic(result.residual, n_free)
+        aic, bic = result.aic, result.bic
 
         stats_text = f"R² = {r_squared:.4f}\n"
         stats_text += f"χ²ᵣ = {result.redchi:.2e}\n"
@@ -3900,8 +4835,8 @@ class C1sPeakViewerFinal:
         self.peak_tree_items.clear()
 
         try:
-            # Calculate areas
-            areas = calculate_peak_areas(self.current_energy, self.current_result)
+            # Calculate areas (cached on current_result)
+            areas = self._peak_areas_cached(self.current_energy, self.current_result)
 
             # Validate that all expected peaks are present
             for expected_name in self.peak_names:
@@ -3909,7 +4844,7 @@ class C1sPeakViewerFinal:
                     areas[expected_name] = 0.0
 
             # Calculate percentages for peaks in QUANTITATION only
-            selected_areas = {k: v for k, v in areas.items() if self.peak_in_quant[k].get()}
+            selected_areas = {k: v for k, v in areas.items() if self.peak_in_fit[k].get()}
             total_selected_area = sum(selected_areas.values())
 
             if total_selected_area == 0:
@@ -3930,29 +4865,36 @@ class C1sPeakViewerFinal:
 
         # Add peak rows to Treeview
         for i, (name, display_name) in enumerate(zip(self.peak_names, self.peak_display_names), 1):
-            # Get checkbox states
+            # Get include state
             in_fit = self.peak_in_fit[name].get()
-            fit_char = 'Y' if in_fit else '-'
-            quant_char = 'Y' if self.peak_in_quant[name].get() else '-'
+            include_char = '☑' if in_fit else '☐'
 
             if in_fit:
                 # Active peak: show full parameters
                 center = result.params[f'c{i}'].value
                 if i <= 6:
-                    fwhm = result.params['main_fwhm'].value
+                    fwhm_key = 'main_fwhm'
                 elif i == 7:
-                    fwhm = result.params['carb_fwhm'].value
+                    fwhm_key = 'carb_fwhm'
                 else:
-                    fwhm = result.params['sigma_fwhm'].value
+                    fwhm_key = 'sigma_fwhm'
+                fwhm = result.params[fwhm_key].value
                 pct = percentages[name]
-                values = (display_name, f"{center:.2f}", f"{fwhm:.2f}", f"{pct:.1f}")
+                rel_unc = self._relative_area_unc(
+                    height=result.params[f'h{i}'].value,
+                    fwhm=fwhm,
+                    h_stderr=result.params[f'h{i}'].stderr,
+                    fwhm_stderr=result.params[fwhm_key].stderr,
+                )
+                unc_str = f"{rel_unc * pct:.1f}" if (rel_unc is not None and pct > 0) else "—"
+                values = (display_name, f"{center:.2f}", f"{fwhm:.2f}", f"{pct:.1f}", unc_str)
             else:
                 # Excluded peak: show dashes
-                values = (display_name, "---", "---", "---")
+                values = (display_name, "---", "---", "---", "---")
 
             # Insert into tree
             item_id = self.peak_tree.insert('', 'end',
-                                            text=f"{fit_char} {quant_char}",
+                                            text=include_char,
                                             values=values,
                                             tags=(name,))
 
@@ -3968,13 +4910,19 @@ class C1sPeakViewerFinal:
     def on_fit_checkbox_changed(self):
         """Handle fit checkbox change - requires refitting."""
         if self._fit_in_progress:
-            return  # Ignore if already fitting
+            # The checkbox variable has already flipped; dropping the refit
+            # here would leave the displayed fit out of sync with the
+            # checkboxes. Remember the request and rerun when the current
+            # fit finishes (multiple rapid toggles coalesce into one refit).
+            self._refit_pending = True
+            return
 
         def do_refit():
             self._fit_in_progress = True
             try:
-                # Run the actual fitting
-                self.refit_with_enabled_peaks()
+                # Fresh-start so toggling a peak doesn't reseed the optimizer
+                # at a stuck local minimum where the toggled peak was masked.
+                self.refit_with_enabled_peaks(fresh_start=True)
                 # Schedule UI updates on main thread
                 self.root.after(0, self._finish_refit)
             except Exception as e:
@@ -3998,12 +4946,11 @@ class C1sPeakViewerFinal:
         self.update_statistics()
         self.update_statistics_tab()
         self._save_file_state()
-
-    def on_quant_checkbox_changed(self):
-        """Handle quantitation checkbox change - just recalculate percentages, no refit."""
-        self.update_peak_parameters()
-        self.update_statistics_tab()
-        self._save_file_state()
+        # A toggle arrived while we were fitting — refit with the current
+        # checkbox state so the display catches up.
+        if getattr(self, '_refit_pending', False):
+            self._refit_pending = False
+            self.on_fit_checkbox_changed()
 
     def update_statistics_tab(self):
         """Update statistics tab for current sample."""
@@ -4011,9 +4958,9 @@ class C1sPeakViewerFinal:
             return
 
         try:
-            areas = calculate_peak_areas(self.current_energy, self.current_result)
-            # Use peak_in_quant for quantitation (not peak_in_fit)
-            selected_areas = {k: v for k, v in areas.items() if self.peak_in_quant[k].get()}
+            areas = self._peak_areas_cached(self.current_energy, self.current_result)
+            # peak_in_fit drives quantitation
+            selected_areas = {k: v for k, v in areas.items() if self.peak_in_fit[k].get()}
             total_area = sum(selected_areas.values())
 
             if total_area > 0:
@@ -4027,81 +4974,13 @@ class C1sPeakViewerFinal:
             self.stat_labels['carboxyl'].config(text=f"{percentages.get('Carboxyl', 0.0):.1f}%")
             self.stat_labels['oalkyl'].config(text=f"{percentages.get('O_alkyl', 0.0):.1f}%")
             self.stat_labels['carbonate'].config(text=f"{percentages.get('Carbonate', 0.0):.1f}%")
+            self._set_ratio_labels(percentages)
 
-            num_selected = sum(1 for enabled in self.peak_in_quant.values() if enabled.get())
+            num_selected = sum(1 for enabled in self.peak_in_fit.values() if enabled.get())
             self.stat_labels['total'].config(text=f"{num_selected} peaks")
-
-            # Update visualizations
-            self.update_statistics_plots(percentages, selected_areas)
 
         except Exception as e:
             print(f"Error updating statistics tab: {e}")
-
-    def update_statistics_plots(self, percentages, selected_areas):
-        """Update statistics visualization plots with publication quality."""
-        self.stats_fig.clear()
-
-        selected_names = [self.peak_display_names[i] for i, name in enumerate(self.peak_names)
-                         if self.peak_in_quant[name].get() and percentages.get(name, 0) > 0]
-        selected_values = [percentages[name] for name in self.peak_names
-                          if self.peak_in_quant[name].get() and percentages.get(name, 0) > 0]
-        selected_colors = [self.peak_colors[i] for i, name in enumerate(self.peak_names)
-                          if self.peak_in_quant[name].get() and percentages.get(name, 0) > 0]
-
-        if not selected_values:
-            ax = self.stats_fig.add_subplot(111)
-            ax.text(0.5, 0.5, 'No peaks selected for quantification',
-                   ha='center', va='center', fontsize=14)
-            ax.axis('off')
-            self.stats_canvas.draw()
-            return
-
-        # Publication quality settings
-        plt.rcParams.update({
-            'font.family': 'Arial',
-            'font.size': 12,
-            'axes.linewidth': 1.5,
-            'axes.labelweight': 'bold',
-            'xtick.major.width': 1.5,
-            'ytick.major.width': 1.5,
-        })
-
-        # Pie chart
-        ax1 = self.stats_fig.add_subplot(121)
-        wedges, texts, autotexts = ax1.pie(selected_values, labels=selected_names,
-                                           colors=selected_colors, autopct='%1.1f%%',
-                                           startangle=90, textprops={'fontsize': 11})
-        for autotext in autotexts:
-            autotext.set_color('white')
-            autotext.set_fontweight('bold')
-            autotext.set_fontsize(11)
-        for text in texts:
-            text.set_fontsize(11)
-            text.set_fontweight('bold')
-        ax1.set_title('Peak Distribution', fontsize=14, fontweight='bold', pad=15)
-
-        # Bar chart
-        ax2 = self.stats_fig.add_subplot(122)
-        x_pos = np.arange(len(selected_names))
-        bars = ax2.bar(x_pos, selected_values, color=selected_colors, alpha=0.85,
-                       edgecolor='black', linewidth=1.2)
-        ax2.set_ylabel('Percentage (%)', fontsize=13, fontweight='bold')
-        ax2.set_title('Peak Percentages', fontsize=14, fontweight='bold', pad=15)
-        ax2.set_xticks(x_pos)
-        ax2.set_xticklabels(selected_names, rotation=45, ha='right', fontsize=11, fontweight='bold')
-        ax2.tick_params(axis='y', labelsize=11)
-        ax2.grid(True, alpha=0.3, axis='y', linestyle='--')
-        ax2.set_axisbelow(True)  # Grid behind bars
-        ax2.spines['top'].set_visible(False)
-        ax2.spines['right'].set_visible(False)
-
-        for bar, value in zip(bars, selected_values):
-            height = bar.get_height()
-            ax2.text(bar.get_x() + bar.get_width()/2., height + 0.5,
-                    f'{value:.1f}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
-
-        self.stats_fig.tight_layout(pad=2.0)
-        self.stats_canvas.draw()
 
     def filter_stats_samples(self, *args):
         """Filter stats samples list based on search."""
@@ -4115,169 +4994,12 @@ class C1sPeakViewerFinal:
             if search_term == '' or search_term in name.lower():
                 self.stats_samples_listbox.insert(tk.END, name)
 
-    def generate_multi_sample_stats(self):
-        """Generate statistics for multiple selected samples."""
-        selections = self.stats_samples_listbox.curselection()
-        if not selections:
-            messagebox.showwarning("Warning", "No samples selected. Please select samples from the list.")
-            return
-
-        # Collect data from selected samples
-        all_percentages = {}
-        sample_names = []
-
-        for idx in selections:
-            sample_name = self.stats_samples_listbox.get(idx)
-            sample_names.append(sample_name)
-
-            # Find the sample file
-            sample_path = None
-            for f in self.spectra_files:
-                if f.stem == sample_name:
-                    sample_path = f
-                    break
-
-            if sample_path:
-                try:
-                    energy, intensity = load_spectrum(sample_path)
-                    result = self.fit_spectrum_with_custom_centers(energy, intensity) if self.custom_peak_centers.get() else fit_spectrum(energy, intensity)
-                    areas = calculate_peak_areas(energy, result)
-                    # Use peak_in_quant for quantitation
-                    selected_areas = {k: v for k, v in areas.items() if self.peak_in_quant[k].get()}
-                    total = sum(selected_areas.values())
-                    if total > 0:
-                        all_percentages[sample_name] = {k: v/total*100 for k, v in selected_areas.items()}
-                    else:
-                        all_percentages[sample_name] = {k: 0.0 for k in selected_areas.keys()}
-                except Exception as e:
-                    print(f"Error processing {sample_name}: {e}")
-
-        if not all_percentages:
-            messagebox.showerror("Error", "Could not process any samples.")
-            return
-
-        # Update status label
-        self.stats_status_label.config(text=f"Showing statistics for {len(sample_names)} samples")
-
-        # Calculate average statistics
-        avg_percentages = {}
-        for peak_name in self.peak_names:
-            if self.peak_in_quant[peak_name].get():
-                values = [all_percentages[s].get(peak_name, 0) for s in sample_names]
-                avg_percentages[peak_name] = np.mean(values)
-
-        # Update summary labels with averages
-        self.stat_labels['aromaticity'].config(text=f"{avg_percentages.get('Aromatic', 0.0):.1f}% (avg)")
-        self.stat_labels['aliphatic'].config(text=f"{avg_percentages.get('Aliphatic', 0.0):.1f}% (avg)")
-        self.stat_labels['carboxyl'].config(text=f"{avg_percentages.get('Carboxyl', 0.0):.1f}% (avg)")
-        self.stat_labels['oalkyl'].config(text=f"{avg_percentages.get('O_alkyl', 0.0):.1f}% (avg)")
-        self.stat_labels['carbonate'].config(text=f"{avg_percentages.get('Carbonate', 0.0):.1f}% (avg)")
-        self.stat_labels['total'].config(text=f"{len(sample_names)} samples")
-
-        # Generate publication quality plots
-        self.generate_multi_sample_plots(all_percentages, sample_names)
-
-    def generate_multi_sample_plots(self, all_percentages, sample_names):
-        """Generate publication quality plots for multiple samples."""
-        self.stats_fig.clear()
-
-        # Publication quality settings
-        plt.rcParams.update({
-            'font.family': 'Arial',
-            'font.size': 11,
-            'axes.linewidth': 1.5,
-            'axes.labelweight': 'bold',
-            'xtick.major.width': 1.5,
-            'ytick.major.width': 1.5,
-        })
-
-        # Get enabled peaks
-        enabled_peaks = [name for name in self.peak_names if self.peak_in_quant[name].get()]
-        enabled_display = [self.peak_display_names[i] for i, name in enumerate(self.peak_names)
-                          if self.peak_in_quant[name].get()]
-        enabled_colors = [self.peak_colors[i] for i, name in enumerate(self.peak_names)
-                         if self.peak_in_quant[name].get()]
-
-        if len(sample_names) == 1:
-            # Single sample - pie and bar
-            percentages = all_percentages[sample_names[0]]
-            selected_values = [percentages.get(name, 0) for name in enabled_peaks if percentages.get(name, 0) > 0]
-            selected_names = [enabled_display[i] for i, name in enumerate(enabled_peaks) if percentages.get(name, 0) > 0]
-            selected_colors = [enabled_colors[i] for i, name in enumerate(enabled_peaks) if percentages.get(name, 0) > 0]
-
-            ax1 = self.stats_fig.add_subplot(121)
-            wedges, texts, autotexts = ax1.pie(selected_values, labels=selected_names,
-                                               colors=selected_colors, autopct='%1.1f%%',
-                                               startangle=90, textprops={'fontsize': 11})
-            for autotext in autotexts:
-                autotext.set_color('white')
-                autotext.set_fontweight('bold')
-            ax1.set_title(f'{sample_names[0]}', fontsize=12, fontweight='bold')
-
-            ax2 = self.stats_fig.add_subplot(122)
-            x_pos = np.arange(len(selected_names))
-            bars = ax2.bar(x_pos, selected_values, color=selected_colors, alpha=0.85,
-                           edgecolor='black', linewidth=1.2)
-            ax2.set_ylabel('Percentage (%)', fontsize=12, fontweight='bold')
-            ax2.set_xticks(x_pos)
-            ax2.set_xticklabels(selected_names, rotation=45, ha='right', fontsize=10)
-            ax2.grid(True, alpha=0.3, axis='y', linestyle='--')
-            ax2.spines['top'].set_visible(False)
-            ax2.spines['right'].set_visible(False)
-
-        else:
-            # Multiple samples - grouped bar with error bars
-            ax1 = self.stats_fig.add_subplot(121)
-
-            # Calculate means and stds
-            means = []
-            stds = []
-            for peak_name in enabled_peaks:
-                values = [all_percentages[s].get(peak_name, 0) for s in sample_names]
-                means.append(np.mean(values))
-                stds.append(np.std(values))
-
-            x_pos = np.arange(len(enabled_peaks))
-            bars = ax1.bar(x_pos, means, yerr=stds, color=enabled_colors, alpha=0.85,
-                           edgecolor='black', linewidth=1.2, capsize=5, error_kw={'linewidth': 1.5})
-            ax1.set_ylabel('Percentage (%)', fontsize=12, fontweight='bold')
-            ax1.set_title(f'Average Peak Distribution (n={len(sample_names)})',
-                         fontsize=13, fontweight='bold')
-            ax1.set_xticks(x_pos)
-            ax1.set_xticklabels(enabled_display, rotation=45, ha='right', fontsize=10, fontweight='bold')
-            ax1.grid(True, alpha=0.3, axis='y', linestyle='--')
-            ax1.spines['top'].set_visible(False)
-            ax1.spines['right'].set_visible(False)
-
-            # Grouped bar chart for each sample
-            ax2 = self.stats_fig.add_subplot(122)
-            x = np.arange(len(enabled_peaks))
-            width = 0.8 / len(sample_names)
-            colors = plt.cm.tab10(np.linspace(0, 1, len(sample_names)))
-
-            for i, sample_name in enumerate(sample_names):
-                vals = [all_percentages[sample_name].get(pname, 0) for pname in enabled_peaks]
-                offset = (i - len(sample_names)/2 + 0.5) * width
-                ax2.bar(x + offset, vals, width, label=sample_name[:20], alpha=0.85,
-                       edgecolor='black', linewidth=0.8, color=colors[i])
-
-            ax2.set_ylabel('Percentage (%)', fontsize=12, fontweight='bold')
-            ax2.set_title('Sample Comparison', fontsize=13, fontweight='bold')
-            ax2.set_xticks(x)
-            ax2.set_xticklabels(enabled_display, rotation=45, ha='right', fontsize=10, fontweight='bold')
-            ax2.legend(fontsize=8, loc='upper right')
-            ax2.grid(True, alpha=0.3, axis='y', linestyle='--')
-            ax2.spines['top'].set_visible(False)
-            ax2.spines['right'].set_visible(False)
-
-        self.stats_fig.tight_layout(pad=2.0)
-        self.stats_canvas.draw()
-
     def _current_peak_sel(self):
-        """Return a snapshot of current F/Q checkbox states."""
+        """Return a snapshot of current include checkbox states."""
+        peaks = {name: self.peak_in_fit[name].get() for name in self.peak_names}
         return {
-            'fit_peaks': {name: self.peak_in_fit[name].get() for name in self.peak_names},
-            'quant_peaks': {name: self.peak_in_quant[name].get() for name in self.peak_names},
+            'fit_peaks': peaks,
+            'quant_peaks': peaks,  # backward compat
         }
 
     def add_selected_to_comparison(self):
@@ -4343,147 +5065,6 @@ class C1sPeakViewerFinal:
         """Clear all comparison samples."""
         self.comparison_listbox.delete(0, tk.END)
         self.comparison_samples = []
-
-    def generate_comparison(self):
-        """Generate multi-sample comparison using per-sample peak selections."""
-        if len(self.comparison_samples) < 2:
-            messagebox.showwarning("Warning", "Add at least 2 samples to compare")
-            return
-
-        self.comparison_fig.clear()
-
-        # Union of all per-sample quant peaks for chart layout
-        union_quant = set()
-        for _name, _result, _energy, peak_sel in self.comparison_samples:
-            for pn in self.peak_names:
-                if peak_sel['quant_peaks'].get(pn, False):
-                    union_quant.add(pn)
-
-        enabled_peaks = [name for name in self.peak_names if name in union_quant]
-        enabled_display = [self.peak_display_names[i] for i, name in enumerate(self.peak_names)
-                          if name in union_quant]
-        enabled_colors = [self.peak_colors[i] for i, name in enumerate(self.peak_names)
-                         if name in union_quant]
-
-        if not enabled_peaks:
-            ax = self.comparison_fig.add_subplot(111)
-            ax.text(0.5, 0.5, 'No peaks enabled for quantification',
-                   ha='center', va='center', fontsize=14)
-            ax.axis('off')
-            self.comparison_canvas.draw()
-            return
-
-        # Calculate areas per sample using each sample's own quant peak set
-        all_percentages = {}
-        for name, result, energy, peak_sel in self.comparison_samples:
-            areas = calculate_peak_areas(energy, result)
-            sample_quant = [pn for pn in self.peak_names if peak_sel['quant_peaks'].get(pn, False)]
-            enabled_areas = {k: v for k, v in areas.items() if k in sample_quant}
-            total = sum(enabled_areas.values())
-            if total > 0:
-                pcts = {k: v/total*100 for k, v in enabled_areas.items()}
-            else:
-                pcts = {}
-            # Fill 0 for union peaks not in this sample's quant set
-            all_percentages[name] = {k: pcts.get(k, 0.0) for k in enabled_peaks}
-
-        sample_names = [name for name, _, _, _ in self.comparison_samples]
-
-        # Plot 1: Grouped bar chart
-        ax1 = self.comparison_fig.add_subplot(221)
-        x = np.arange(len(enabled_peaks))
-        width = 0.8 / len(self.comparison_samples)
-
-        for i, (name, _, _, _) in enumerate(self.comparison_samples):
-            vals = [all_percentages[name].get(pname, 0) for pname in enabled_peaks]
-            offset = (i - len(self.comparison_samples)/2 + 0.5) * width
-            ax1.bar(x + offset, vals, width, label=name, alpha=0.8)
-
-        ax1.set_ylabel('Percentage (%)')
-        ax1.set_title('Peak Distribution Comparison')
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(enabled_display, rotation=45, ha='right')
-        ax1.legend(fontsize=8)
-        ax1.grid(True, alpha=0.3, axis='y')
-
-        # Plot 2: Ratio heatmap (only enabled peaks)
-        ax2 = self.comparison_fig.add_subplot(222)
-
-        n_samples = len(self.comparison_samples)
-        n_peaks = len(enabled_peaks)
-
-        # Create ratio matrix: peaks x samples (relative to first sample)
-        ratio_matrix = np.zeros((n_peaks, n_samples))
-        reference_name = sample_names[0]
-
-        for i, peak_name in enumerate(enabled_peaks):
-            for j, sample_name in enumerate(sample_names):
-                val_sample = all_percentages[sample_name].get(peak_name, 0)
-                val_ref = all_percentages[reference_name].get(peak_name, 0)
-
-                if val_ref > 0.1:
-                    ratio_matrix[i, j] = val_sample / val_ref
-                else:
-                    ratio_matrix[i, j] = np.nan
-
-        sns.heatmap(ratio_matrix, annot=True, fmt='.2f', cmap='RdBu_r',
-                   center=1.0, vmin=0, vmax=3,
-                   xticklabels=sample_names,
-                   yticklabels=enabled_display,
-                   cbar_kws={'label': 'Ratio'},
-                   ax=ax2)
-        ax2.set_title(f'Peak Ratio (vs {reference_name})')
-
-        # Plot 3: Stacked bar chart (only enabled peaks)
-        ax3 = self.comparison_fig.add_subplot(223)
-
-        bottoms = np.zeros(len(self.comparison_samples))
-        for i, (pname, disp_name, color) in enumerate(zip(enabled_peaks, enabled_display, enabled_colors)):
-            vals = [all_percentages[name].get(pname, 0) for name, _, _, _ in self.comparison_samples]
-            ax3.bar(range(len(self.comparison_samples)), vals, bottom=bottoms,
-                   label=disp_name, color=color, alpha=0.8)
-            bottoms += vals
-
-        ax3.set_ylabel('Percentage (%)')
-        ax3.set_title('Stacked Peak Distribution')
-        ax3.set_xticks(range(len(self.comparison_samples)))
-        ax3.set_xticklabels(sample_names, rotation=45, ha='right')
-        ax3.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
-
-        # Plot 4: Summary table as grid (only enabled peaks)
-        ax4 = self.comparison_fig.add_subplot(224)
-        ax4.axis('off')
-
-        # Create a table with samples as columns and peaks as rows
-        n_samples = len(sample_names)
-        n_peaks_to_show = min(len(enabled_peaks), 6)  # Show up to 6 peaks
-
-        # Build table data
-        cell_text = []
-        for pname, dname in zip(enabled_peaks[:n_peaks_to_show], enabled_display[:n_peaks_to_show]):
-            row = [f"{all_percentages[name].get(pname, 0):.1f}%" for name in sample_names]
-            cell_text.append(row)
-
-        # Truncate sample names for display
-        col_labels = [name[:12] + '...' if len(name) > 12 else name for name in sample_names]
-        row_labels = enabled_display[:n_peaks_to_show]
-
-        # Create table
-        table = ax4.table(cellText=cell_text,
-                         rowLabels=row_labels,
-                         colLabels=col_labels,
-                         cellLoc='center',
-                         loc='center',
-                         colColours=['lightblue'] * n_samples,
-                         rowColours=[self.peak_colors[self.peak_names.index(p)] for p in enabled_peaks[:n_peaks_to_show]])
-
-        table.auto_set_font_size(False)
-        table.set_fontsize(9)
-        table.scale(1.2, 1.5)
-        ax4.set_title('Peak Percentages by Sample', fontsize=11, fontweight='bold')
-
-        self.comparison_fig.tight_layout()
-        self.comparison_canvas.draw()
 
     def previous_spectrum(self):
         """Load previous spectrum."""
@@ -4676,27 +5257,21 @@ class C1sPeakViewerFinal:
         export_dir.mkdir(exist_ok=True)
 
         try:
-            # 1. Export all three plot types
+            # 1. Export all four plot types
             plots_dir = export_dir / "plots"
             plots_dir.mkdir(exist_ok=True)
 
-            # Store current figure state
-            original_fig_state = self.analysis_fig.axes.copy() if self.analysis_fig.axes else []
-
-            # Generate and export Statistics plot
-            self.generate_multi_sample_stats()
-            self.analysis_fig.savefig(plots_dir / "statistics_summary.pdf", dpi=300, bbox_inches='tight')
-            self.analysis_fig.savefig(plots_dir / "statistics_summary.png", dpi=300, bbox_inches='tight')
-
-            # Generate and export Comparison Charts
-            self.generate_comparison()
-            self.analysis_fig.savefig(plots_dir / "comparison_charts.pdf", dpi=300, bbox_inches='tight')
-            self.analysis_fig.savefig(plots_dir / "comparison_charts.png", dpi=300, bbox_inches='tight')
-
-            # Generate and export Spectral Overlay
-            self.generate_spectral_overlay()
-            self.analysis_fig.savefig(plots_dir / "spectral_overlay.pdf", dpi=300, bbox_inches='tight')
-            self.analysis_fig.savefig(plots_dir / "spectral_overlay.png", dpi=300, bbox_inches='tight')
+            # Store current figure type; restore even if an export fails
+            orig_type = self.figure_type_var.get()
+            try:
+                for fig_type in ['Stacked Bar', 'Grouped Bar', 'Mean \u00b1 Std', 'Spectral Overlay']:
+                    self.figure_type_var.set(fig_type)
+                    self.generate_current_figure()
+                    safe_name = fig_type.lower().replace(' ', '_').replace('\u00b1', 'pm')
+                    self.analysis_fig.savefig(plots_dir / f"{safe_name}.pdf", dpi=300, bbox_inches='tight')
+                    self.analysis_fig.savefig(plots_dir / f"{safe_name}.png", dpi=300, bbox_inches='tight')
+            finally:
+                self.figure_type_var.set(orig_type)
 
             # 2. Export comprehensive data for each sample
             samples_dir = export_dir / "sample_data"
@@ -4921,8 +5496,9 @@ class C1sPeakViewerFinal:
                 f.write("EXPORTED FILES\n")
                 f.write("-" * 70 + "\n")
                 f.write("plots/\n")
-                f.write("  - statistics_summary.pdf/png\n")
-                f.write("  - comparison_charts.pdf/png\n")
+                f.write("  - stacked_bar.pdf/png\n")
+                f.write("  - grouped_bar.pdf/png\n")
+                f.write("  - mean_pm_std.pdf/png\n")
                 f.write("  - spectral_overlay.pdf/png\n")
                 f.write("sample_data/\n")
                 f.write("  - [sample_name]/\n")
@@ -4938,7 +5514,7 @@ class C1sPeakViewerFinal:
             messagebox.showinfo("Export Complete",
                               f"Complete analysis exported to:\n{export_dir}\n\n"
                               f"Included:\n"
-                              f"• 3 plot types (PDF & PNG)\n"
+                              f"• 4 plot types (PDF & PNG)\n"
                               f"• {n_samples} sample data packages\n"
                               f"• Analysis summary CSV\n"
                               f"• Combined peak parameters CSV\n"
@@ -5051,7 +5627,7 @@ class C1sPeakViewerFinal:
                     elif peak_name == 'Sigma_star':
                         fwhm = params_dict.get('sigma_fwhm', 0.6)
                     else:
-                        fwhm = params_dict.get('main_fwhm', 1.5)
+                        fwhm = params_dict.get('main_fwhm', 1.0)
 
                     center = params_dict.get(f'c{j+1}', self.default_peak_centers[peak_name])
                     height = params_dict.get(f'h{j+1}', 0)
@@ -5119,7 +5695,7 @@ class C1sPeakViewerFinal:
 
             # 2. Calculate areas and percentages
             areas = calculate_peak_areas(energy, result)
-            selected_areas_quant = {k: v for k, v in areas.items() if self.peak_in_quant[k].get()}
+            selected_areas_quant = {k: v for k, v in areas.items() if self.peak_in_fit[k].get()}
             total_quant = sum(selected_areas_quant.values())
 
             # 3. Export peak parameters CSV
@@ -5138,7 +5714,7 @@ class C1sPeakViewerFinal:
                 area = areas.get(name, 0)
                 pct_quant = (selected_areas_quant.get(name, 0) / total_quant * 100) if total_quant > 0 else 0
                 in_fit = self.peak_in_fit[name].get()
-                in_quant = self.peak_in_quant[name].get()
+                in_quant = self.peak_in_fit[name].get()
 
                 peak_data.append({
                     'Peak': display_name,
@@ -5235,7 +5811,7 @@ class C1sPeakViewerFinal:
                 },
                 'settings': {
                     'peaks_in_fit': [name for name in self.peak_names if self.peak_in_fit[name].get()],
-                    'peaks_in_quantification': [name for name in self.peak_names if self.peak_in_quant[name].get()],
+                    'peaks_in_quantification': [name for name in self.peak_names if self.peak_in_fit[name].get()],
                     'manual_baseline': self.manual_baseline.get(),
                     'custom_peak_centers': self.custom_peak_centers.get()
                 }
@@ -5294,7 +5870,7 @@ class C1sPeakViewerFinal:
                     pct = (selected_areas_quant.get(name, 0) / total_quant * 100) if total_quant > 0 else 0
 
                     fit_mark = '*' if self.peak_in_fit[name].get() else ' '
-                    quant_mark = '+' if self.peak_in_quant[name].get() else ' '
+                    quant_mark = '+' if self.peak_in_fit[name].get() else ' '
 
                     f.write(f"{fit_mark}{quant_mark}{display_name:<10} {center:>8.3f} {height:>10.5f} {fwhm:>8.3f} {area:>10.5f} {pct:>7.1f}%\n")
 
@@ -5364,7 +5940,7 @@ class C1sPeakViewerFinal:
 
                     # Calculate areas
                     areas = calculate_peak_areas(energy, result)
-                    selected_areas = {k: v for k, v in areas.items() if self.peak_in_quant[k].get()}
+                    selected_areas = {k: v for k, v in areas.items() if self.peak_in_fit[k].get()}
                     total_area = sum(selected_areas.values())
 
                     r_squared = 1 - result.residual.var() / np.var(result.data)
@@ -5379,7 +5955,7 @@ class C1sPeakViewerFinal:
 
                     # Add percentages for each peak
                     for name, display_name in zip(self.peak_names, self.peak_display_names):
-                        if self.peak_in_quant[name].get():
+                        if self.peak_in_fit[name].get():
                             pct = (selected_areas.get(name, 0) / total_area * 100) if total_area > 0 else 0
                             row[f'{display_name}_%'] = round(pct, 2)
 
@@ -5455,6 +6031,94 @@ class C1sPeakViewerFinal:
             self.load_current_spectrum()
             messagebox.showerror("Batch Export Error", f"Export failed:\n{str(e)}")
 
+    def export_quick_summary_csv(self):
+        """Flat one-row-per-sample summary CSV using cached fits where available.
+
+        Faster than batch_export_all (no per-sample directories, no forced refit
+        of already-fit samples). Samples without a cached fit are fit on the fly.
+        """
+        if not self.spectra_files:
+            messagebox.showwarning("Warning", "No samples loaded")
+            return
+
+        out_path = filedialog.asksaveasfilename(
+            title="Save Quick Summary CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile="summary.csv",
+        )
+        if not out_path:
+            return
+
+        rows = []
+        errors = []
+        for file_path in self.spectra_files:
+            sample_name = file_path.stem
+            cached = self.file_state_cache.get(str(file_path))
+            try:
+                # Session-loaded snapshots are frozen (vary=False) evaluations;
+                # their redchi/AIC/BIC differ from a real fit, so refit them
+                # here just like the display path does.
+                if (cached and cached.get('result') is not None
+                        and not getattr(cached['result'], '_is_session_loaded', False)):
+                    result = cached['result']
+                    energy = cached['energy']
+                    fit_peaks = cached.get('fit_peaks',
+                        {n: True for n in self.peak_names})
+                else:
+                    if cached and cached.get('energy') is not None:
+                        energy, intensity = cached['energy'], cached['intensity']
+                    else:
+                        energy, intensity = load_spectrum(file_path)
+                    if self.custom_peak_centers.get():
+                        result = self.fit_spectrum_with_custom_centers(energy, intensity)
+                    else:
+                        result = fit_spectrum(energy, intensity)
+                    fit_peaks = (cached.get('fit_peaks') if cached else None) or \
+                        {n: self.peak_in_fit[n].get() for n in self.peak_names}
+
+                areas = self._peak_areas_cached(energy, result)
+                sel_areas = {k: v for k, v in areas.items() if fit_peaks.get(k, False)}
+                total = sum(sel_areas.values())
+                pcts = ({k: v / total * 100 for k, v in sel_areas.items()}
+                        if total > 0 else {k: 0.0 for k in sel_areas})
+
+                r_squared = 1 - result.residual.var() / np.var(result.data)
+                ratios = self._compute_xas_ratios({n: pcts.get(n, 0.0)
+                                                    for n in self.peak_names})
+
+                row = {
+                    'Sample': sample_name,
+                    'R2': round(r_squared, 5),
+                    'RedChi2': round(float(result.redchi), 5),
+                    'AIC': round(float(result.aic), 2),
+                    'BIC': round(float(result.bic), 2),
+                    'N_peaks': sum(1 for v in fit_peaks.values() if v),
+                }
+                for name, display in zip(self.peak_names, self.peak_display_names):
+                    row[f'{display}_%'] = round(pcts.get(name, 0.0), 2)
+                row['Aromaticity_index'] = (round(ratios['aromaticity_index'], 4)
+                                            if ratios['aromaticity_index'] is not None else None)
+                row['Carboxyl_Aromatic'] = (round(ratios['carboxyl_aromatic'], 4)
+                                            if ratios['carboxyl_aromatic'] is not None else None)
+                row['Oxygenated_C_fraction'] = (round(ratios['oxygenated_fraction'], 4)
+                                                if ratios['oxygenated_fraction'] is not None else None)
+                rows.append(row)
+            except Exception as e:
+                errors.append(f"{sample_name}: {e}")
+
+        if not rows:
+            messagebox.showerror("Summary Export", "No samples could be processed.")
+            return
+
+        pd.DataFrame(rows).to_csv(out_path, index=False)
+        msg = f"Wrote {len(rows)} samples to:\n{out_path}"
+        if errors:
+            msg += f"\n\nSkipped {len(errors)}:\n" + "\n".join(errors[:5])
+            if len(errors) > 5:
+                msg += f"\n… and {len(errors) - 5} more"
+        messagebox.showinfo("Quick Summary CSV", msg)
+
     def _set_app_icon(self):
         """Set application icon using the best available method."""
         # Handle both development and PyInstaller compiled mode
@@ -5466,7 +6130,7 @@ class C1sPeakViewerFinal:
             base_path = Path(__file__).parent
 
         # Try PNG with wm_iconphoto first (often renders more crisply)
-        png_sizes = [256, 128, 64, 48, 32]  # Try larger sizes first
+        png_sizes = [512, 256, 128, 64, 48, 32]  # Try larger sizes first
         for size in png_sizes:
             png_path = base_path / f"carbonpeaks_{size}.png"
             if png_path.exists():
@@ -5495,6 +6159,26 @@ def _get_base_path():
     return Path(__file__).parent
 
 
+def _enable_windows_dpi_awareness():
+    """Declare the process DPI-aware so Windows doesn't bitmap-stretch the UI.
+
+    Without this, every window (including the splash) is rendered at 96 DPI
+    and upscaled on scaled displays (125%/150%), which blurs text and images.
+    Must be called before tk.Tk() — Tk reads the DPI once at startup to set
+    its font scaling.
+    """
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # system-DPI aware
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()  # pre-Win8.1 fallback
+    except Exception:
+        pass
+
+
 def _create_splash(root):
     """Create a splash screen showing the app icon during loading."""
     splash = tk.Toplevel(root)
@@ -5502,9 +6186,18 @@ def _create_splash(root):
 
     base_path = _get_base_path()
 
+    # Pick the splash image by display scale: with DPI awareness on, pixels
+    # are physical, so a scaled display needs the 512px render to keep the
+    # splash at roughly the same physical size — and crisp.
+    try:
+        scale = splash.winfo_fpixels('1i') / 96.0
+    except tk.TclError:
+        scale = 1.0
+    sizes = [512, 256, 128, 64] if scale > 1.25 else [256, 128, 64]
+
     # Load the largest available icon for the splash
     icon_image = None
-    for size in [256, 128, 64]:
+    for size in sizes:
         png_path = base_path / f"carbonpeaks_{size}.png"
         if png_path.exists():
             try:
@@ -5559,6 +6252,7 @@ def main():
     except ImportError:
         pass
 
+    _enable_windows_dpi_awareness()
     root = tk.Tk()
     root.withdraw()  # Hide main window while loading
 
